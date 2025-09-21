@@ -12,23 +12,28 @@
 !/download_and_prepare_datasets.py
 !/download_checkpoints_and_tokenizers.py
 
-# Keep core source code
+# Keep core source code (ensure directories are unignored so Git traverses them)
+!/nnet/
 !/nnet/**
+!/configs/
 !/configs/**
 
 # Keep minimal ctcdecode sources needed for Python package
+!/ctcdecode/
 !/ctcdecode/setup.py
 !/ctcdecode/pyproject.toml
 !/ctcdecode/README.md
 !/ctcdecode/ctcdecode/**
 
 # Keep minimal face_detection sources needed for Python package
+!/face_detection/
 !/face_detection/setup.py
 !/face_detection/README.md
 !/face_detection/requirements.txt
 !/face_detection/ibug/**
 
 # Keep small media metadata (needed by preprocessing)
+!/media/
 !/media/*.npy
 
 # Always allow gitkeep placeholders so empty dirs can be tracked if desired
