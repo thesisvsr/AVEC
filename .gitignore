@@ -34,7 +34,8 @@
 
 # Keep small media metadata (needed by preprocessing)
 !/media/
-!/media/*.npy
+# Default-ignore everything inside media, then selectively re-include .npy later
+media/**
 
 # Always allow gitkeep placeholders so empty dirs can be tracked if desired
 !**/.gitkeep
