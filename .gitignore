@@ -60,6 +60,7 @@ dist/
 .ipynb_checkpoints/
 callbacks/**
 datasets/**
+!/datasets/model_test.py
 media/**/*.mp4
 media/**/*.mov
 media/**/*.gif
@@ -86,3 +87,6 @@ face_detection/**/CMakeCache.txt
 face_detection/**/cmake_install.cmake
 face_detection/**/Makefile
 **/.git_backup_*/
+
+# Re-include specific small metadata files
+!/media/*.npy
