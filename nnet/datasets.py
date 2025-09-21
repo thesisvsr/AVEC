@@ -819,6 +819,116 @@ class LRW(Dataset):
         for batch in tqdm(dataloader):
             pass
 
+class LipBengal(Dataset):
+
+    """ LipBengal visual-only word-level dataset.
+
+    Folder structure (example):
+        datasets/
+          LipBengal/
+            s1/                # speaker id
+              WORD_A/
+                01.jpg ...
+              WORD_B/
+                ...
+            s2/
+              ...
+
+    We implement a 60/20/20 split by speakers in sorted order by default.
+    This mirrors LRW's interface and returns (video, None, label) where:
+      - video: Tensor (C, T, H, W) after preprocessing
+      - label: int class index for the Bengali word
+    """
+
+    def __init__(self, batch_size, collate_fn, root="datasets", shuffle=True, mode="train", img_mean=(0.5,), img_std=(0.5,), video_transform=None, speakers_split=None, num_frames=None):
+        super(LipBengal, self).__init__(batch_size=batch_size, collate_fn=collate_fn, root=root, shuffle=shuffle)
+
+        assert mode in ["train", "val", "test"], "mode must be one of train/val/test"
+        self.mode = mode
+        self.num_frames = num_frames  # optional cap
+
+        # Discover speakers
+        lb_root = os.path.join(self.root, "LipBengal")
+        speakers = [d for d in sorted(os.listdir(lb_root)) if d.startswith("s") and os.path.isdir(os.path.join(lb_root, d))]
+        if len(speakers) == 0:
+            raise FileNotFoundError(f"No speakers found under {lb_root}")
+
+        # Default 60/20/20 split by speakers in sorted order
+        if speakers_split is None:
+            n = len(speakers)
+            n_train = int(round(0.6 * n))
+            n_val = int(round(0.2 * n))
+            train_speakers = speakers[:n_train]
+            val_speakers = speakers[n_train:n_train + n_val]
+            test_speakers = speakers[n_train + n_val:]
+            speakers_split = {"train": train_speakers, "val": val_speakers, "test": test_speakers}
+        self.speakers_split = speakers_split
+
+        # Build class dict from all speakers to have a stable global mapping
+        word_set = set()
+        for sp in speakers:
+            sp_dir = os.path.join(lb_root, sp)
+            for word in os.listdir(sp_dir):
+                wdir = os.path.join(sp_dir, word)
+                if os.path.isdir(wdir):
+                    word_set.add(word)
+        self.classes = sorted(list(word_set))
+        self.class_dict = {c: i for i, c in enumerate(self.classes)}
+        self.num_classes = len(self.classes)
+
+        # Gather sample paths for current split
+        self.paths = []  # entries are directories for a single clip (speaker/word)
+        for sp in self.speakers_split[self.mode]:
+            sp_dir = os.path.join(lb_root, sp)
+            for word in os.listdir(sp_dir):
+                wdir = os.path.join(sp_dir, word)
+                if os.path.isdir(wdir):
+                    # ensure there is at least one jpg frame
+                    if len(glob.glob(os.path.join(wdir, "*.jpg"))) > 0:
+                        self.paths.append(wdir)
+
+        # Video preprocessing (grayscale + normalize), optional augment at end
+        self.video_preprocessing = torchvision.transforms.Compose([
+            torchvision.transforms.ConvertImageDtype(dtype=torch.float32),
+            layers.Permute(dims=(1, 0, 2, 3)),   # (C, T, H, W) -> (T, C, H, W)
+            torchvision.transforms.Grayscale(),
+            layers.Permute(dims=(1, 0, 2, 3)),   # (T, C, H, W) -> (C, T, H, W)
+            transforms.NormalizeVideo(mean=img_mean, std=img_std),
+            video_transform if video_transform is not None else nn.Identity(),
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def _load_frames(self, clip_dir):
+        # List jpg frames sorted lexicographically (zero-padded names)
+        frame_files = sorted(glob.glob(os.path.join(clip_dir, "*.jpg")))
+        if self.num_frames is not None and len(frame_files) > self.num_frames:
+            frame_files = frame_files[: self.num_frames]
+        frames = []
+        for fp in frame_files:
+            img = torchvision.io.read_image(fp)  # (C, H, W), uint8
+            frames.append(img)
+        if len(frames) == 0:
+            # Return a dummy single-frame black image if missing
+            frames = [torch.zeros(3, 88, 88, dtype=torch.uint8)]
+        video = torch.stack(frames, dim=0)  # (T, C, H, W)
+        video = video.permute(1, 0, 2, 3)   # (C, T, H, W)
+        return video
+
+    def __getitem__(self, n):
+        clip_dir = self.paths[n]
+        # Label is word directory name
+        word = os.path.basename(clip_dir)
+        label = torch.tensor(self.class_dict[word], dtype=torch.long)
+
+        # Load frames and preprocess
+        video = self._load_frames(clip_dir)
+        video = self.video_preprocessing(video)
+
+        # Return as (video, None, label) to mirror LRW triple layout
+        return video, None, label
+
     def download(self):
 
         # Print

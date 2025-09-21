@@ -17,6 +17,8 @@
 !/nnet/**
 !/configs/
 !/configs/**
+!/configs/LipBengal/
+!/configs/LipBengal/**
 
 # Keep minimal ctcdecode sources needed for Python package
 !/ctcdecode/
