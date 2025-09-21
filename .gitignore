@@ -60,6 +60,7 @@ dist/
 .eggs/
 .ipynb_checkpoints/
 callbacks/**
+!/datasets/
 datasets/**
 !/datasets/model_test.py
 media/**/*.mp4
