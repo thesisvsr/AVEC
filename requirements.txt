@@ -1,0 +1,14 @@
+torch
+torchvision
+torchaudio
+torchtext
+matplotlib
+tensorboard
+jiwer==2.4.0
+# Torch currently at 2.8.0 -> allow NumPy 2; constrain below 2.3 for opencv wheels
+numpy>=2,<2.3
+tqdm
+sentencepiece
+scikit-image
+gdown
+av

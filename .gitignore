@@ -1,0 +1,83 @@
+# Ignore everything by default (strict allowlist)
+/*
+
+# Always keep these root files
+!/.gitignore
+!/README.md
+!/LICENSE
+!/requirements.txt
+!/main.py
+!/functions.py
+!/eval_models.sh
+!/download_and_prepare_datasets.py
+!/download_checkpoints_and_tokenizers.py
+
+# Keep core source code
+!/nnet/**
+!/configs/**
+
+# Keep minimal ctcdecode sources needed for Python package
+!/ctcdecode/setup.py
+!/ctcdecode/pyproject.toml
+!/ctcdecode/README.md
+!/ctcdecode/ctcdecode/**
+
+# Keep minimal face_detection sources needed for Python package
+!/face_detection/setup.py
+!/face_detection/README.md
+!/face_detection/requirements.txt
+!/face_detection/ibug/**
+
+# Keep small media metadata (needed by preprocessing)
+!/media/*.npy
+
+# Always allow gitkeep placeholders so empty dirs can be tracked if desired
+!**/.gitkeep
+
+# Block common generated/binary artifacts regardless
+**/__pycache__/**
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+ENV/
+.env*
+.vscode/
+.idea/
+.DS_Store
+*.swp
+.cache/
+build/
+dist/
+*.egg-info/
+.eggs/
+.ipynb_checkpoints/
+callbacks/**
+datasets/**
+media/**/*.mp4
+media/**/*.mov
+media/**/*.gif
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.npy
+*.tar*
+*.zip
+*.log
+ctcdecode/**/build/**
+ctcdecode/**/_ext/**
+ctcdecode/**/CMakeFiles/**
+ctcdecode/**/CMakeCache.txt
+ctcdecode/**/cmake_install.cmake
+ctcdecode/**/Makefile
+ctcdecode/**/{lib,bin}/**
+ctcdecode/third_party/**
+face_detection/**/build/**
+face_detection/**/dist/**
+face_detection/**/CMakeFiles/**
+face_detection/**/CMakeCache.txt
+face_detection/**/cmake_install.cmake
+face_detection/**/Makefile
+**/.git_backup_*/
