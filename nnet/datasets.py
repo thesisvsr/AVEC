@@ -29,6 +29,7 @@ import requests
 import pickle
 import gdown
 import multiprocessing
+import hashlib
 from nnet import layers
 from nnet import transforms
 from nnet import collate_fn
@@ -840,52 +841,165 @@ class LipBengal(Dataset):
       - label: int class index for the Bengali word
     """
 
-    def __init__(self, batch_size, collate_fn, root="datasets", shuffle=True, mode="train", img_mean=(0.5,), img_std=(0.5,), video_transform=None, speakers_split=None, num_frames=None):
+    def __init__(self, batch_size, collate_fn, root="datasets", shuffle=True, mode="train", img_mean=(0.5,), img_std=(0.5,), video_transform=None, speakers_split=None, num_frames=None, indices_path=None, fixed_frames=None, subset_fraction=1.0, subset_seed=0, prepared_only=False):
         super(LipBengal, self).__init__(batch_size=batch_size, collate_fn=collate_fn, root=root, shuffle=shuffle)
 
         assert mode in ["train", "val", "test"], "mode must be one of train/val/test"
         self.mode = mode
         self.num_frames = num_frames  # optional cap
+        self.indices_path = indices_path
+        self.fixed_frames = fixed_frames  # if set, enforce fixed temporal length for stacking
+        self.prepared_only = prepared_only  # if True, require prepared mouth-crop tensors
+        self.subset_fraction = float(subset_fraction) if subset_fraction is not None else 1.0
+        self.subset_seed = int(subset_seed) if subset_seed is not None else 0
 
-        # Discover speakers
         lb_root = os.path.join(self.root, "LipBengal")
-        speakers = [d for d in sorted(os.listdir(lb_root)) if d.startswith("s") and os.path.isdir(os.path.join(lb_root, d))]
-        if len(speakers) == 0:
-            raise FileNotFoundError(f"No speakers found under {lb_root}")
+        if self.indices_path is not None and os.path.isfile(self.indices_path):
+            try:
+                items = torch.load(self.indices_path, map_location="cpu")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load indices from {self.indices_path}: {e}")
+            # Optionally keep only entries that have a prepared crop path (and file exists)
+            if self.prepared_only:
+                filtered = []
+                miss = 0
+                for it in items:
+                    p = it.get("prepared")
+                    if not p:
+                        # Try to infer prepared path from frames hash and either Banglish word label or original FS word
+                        try:
+                            h = hashlib.sha1()
+                            # Canonicalize frame paths to match prepare script hashing (relative 'datasets/LipBengal/...')
+                            for fp in it.get("frames", []) or []:
+                                try:
+                                    idx = fp.find("datasets/LipBengal/")
+                                    if idx != -1:
+                                        canon = fp[idx:]
+                                    else:
+                                        canon = fp
+                                except Exception:
+                                    canon = fp
+                                h.update(canon.encode("utf-8"))
+                            digest = h.hexdigest()[:16]
+                            base = os.path.basename(self.indices_path)
+                            split = os.path.splitext(base)[0]
+                            speaker = it.get("speaker")
+                            word_idx = it.get("word")
+                            # Original word from the filesystem (parent dir of first frame)
+                            fs_word = None
+                            frs = it.get("frames") or []
+                            if len(frs) > 0:
+                                try:
+                                    fs_word = os.path.basename(os.path.dirname(frs[0]))
+                                except Exception:
+                                    fs_word = None
+                            cand1 = os.path.join(self.root, "LipBengal", "prepared", split, speaker, word_idx or "", f"{digest}.pt") if speaker and word_idx else None
+                            cand2 = os.path.join(self.root, "LipBengal", "prepared", split, speaker, fs_word or "", f"{digest}.pt") if speaker and fs_word else None
+                            for cand in (cand1, cand2):
+                                if cand and os.path.isfile(cand):
+                                    p = cand
+                                    it["prepared"] = p
+                                    break
+                        except Exception:
+                            pass
+                    if p and os.path.isfile(p):
+                        filtered.append(it)
+                    else:
+                        miss += 1
+                self.items = filtered
+                if miss:
+                    try:
+                        print(f"LipBengal[{self.mode}] prepared_only=True: kept {len(filtered)}/{len(items)}; missing {miss}")
+                    except Exception:
+                        pass
+            else:
+                self.items = items
 
-        # Default 60/20/20 split by speakers in sorted order
-        if speakers_split is None:
-            n = len(speakers)
-            n_train = int(round(0.6 * n))
-            n_val = int(round(0.2 * n))
-            train_speakers = speakers[:n_train]
-            val_speakers = speakers[n_train:n_train + n_val]
-            test_speakers = speakers[n_train + n_val:]
-            speakers_split = {"train": train_speakers, "val": val_speakers, "test": test_speakers}
-        self.speakers_split = speakers_split
+            # Build classes from indices 'word' field to remain consistent with label space used during preprocessing
+            word_set = set()
+            for it in self.items:
+                w = it.get("word")
+                if isinstance(w, str) and len(w) > 0:
+                    word_set.add(w)
+            if not word_set:
+                # Fallback to filesystem scan if indices lack words
+                speakers = [d for d in sorted(os.listdir(lb_root)) if d.startswith("s") and os.path.isdir(os.path.join(lb_root, d))]
+                for sp in speakers:
+                    sp_dir = os.path.join(lb_root, sp)
+                    for word in os.listdir(sp_dir):
+                        wdir = os.path.join(sp_dir, word)
+                        if os.path.isdir(wdir):
+                            word_set.add(word)
+            self.classes = sorted(list(word_set))
+            self.class_dict = {c: i for i, c in enumerate(self.classes)}
+            self.num_classes = len(self.classes)
+        else:
+            # Discover speakers
+            speakers = [d for d in sorted(os.listdir(lb_root)) if d.startswith("s") and os.path.isdir(os.path.join(lb_root, d))]
+            if len(speakers) == 0:
+                raise FileNotFoundError(f"No speakers found under {lb_root}")
 
-        # Build class dict from all speakers to have a stable global mapping
-        word_set = set()
-        for sp in speakers:
-            sp_dir = os.path.join(lb_root, sp)
-            for word in os.listdir(sp_dir):
-                wdir = os.path.join(sp_dir, word)
-                if os.path.isdir(wdir):
-                    word_set.add(word)
-        self.classes = sorted(list(word_set))
-        self.class_dict = {c: i for i, c in enumerate(self.classes)}
-        self.num_classes = len(self.classes)
+            # Default 60/20/20 split by speakers in sorted order
+            if speakers_split is None:
+                n = len(speakers)
+                n_train = int(round(0.6 * n))
+                n_val = int(round(0.2 * n))
+                train_speakers = speakers[:n_train]
+                val_speakers = speakers[n_train:n_train + n_val]
+                test_speakers = speakers[n_train + n_val:]
+                speakers_split = {"train": train_speakers, "val": val_speakers, "test": test_speakers}
+            self.speakers_split = speakers_split
 
-        # Gather sample paths for current split
-        self.paths = []  # entries are directories for a single clip (speaker/word)
-        for sp in self.speakers_split[self.mode]:
-            sp_dir = os.path.join(lb_root, sp)
-            for word in os.listdir(sp_dir):
-                wdir = os.path.join(sp_dir, word)
-                if os.path.isdir(wdir):
-                    # ensure there is at least one jpg frame
-                    if len(glob.glob(os.path.join(wdir, "*.jpg"))) > 0:
-                        self.paths.append(wdir)
+            # Build class dict from all speakers to have a stable global mapping
+            word_set = set()
+            for sp in speakers:
+                sp_dir = os.path.join(lb_root, sp)
+                for word in os.listdir(sp_dir):
+                    wdir = os.path.join(sp_dir, word)
+                    if os.path.isdir(wdir):
+                        word_set.add(word)
+            self.classes = sorted(list(word_set))
+            self.class_dict = {c: i for i, c in enumerate(self.classes)}
+            self.num_classes = len(self.classes)
+
+            # Gather sample paths for current split
+            self.paths = []  # entries are directories for a single clip (speaker/word)
+            for sp in self.speakers_split[self.mode]:
+                sp_dir = os.path.join(lb_root, sp)
+                for word in os.listdir(sp_dir):
+                    wdir = os.path.join(sp_dir, word)
+                    if os.path.isdir(wdir):
+                        # ensure there is at least one jpg frame
+                        if len(glob.glob(os.path.join(wdir, "*.jpg"))) > 0:
+                            self.paths.append(wdir)
+
+        # Optional subsetting for quicker experiments
+        if hasattr(self, "items"):
+            total = len(self.items)
+            if self.subset_fraction is not None and self.subset_fraction < 1.0 and total > 0:
+                keep = max(1, int(round(total * self.subset_fraction)))
+                if keep < total:
+                    rng = np.random.RandomState(self.subset_seed)
+                    idx = rng.permutation(total)[:keep]
+                    idx.sort()
+                    self.items = [self.items[i] for i in idx]
+                    try:
+                        print(f"LipBengal[{self.mode}] subset: {keep}/{total} (~{self.subset_fraction*100:.1f}%)")
+                    except Exception:
+                        pass
+        else:
+            total = len(self.paths)
+            if self.subset_fraction is not None and self.subset_fraction < 1.0 and total > 0:
+                keep = max(1, int(round(total * self.subset_fraction)))
+                if keep < total:
+                    rng = np.random.RandomState(self.subset_seed)
+                    idx = rng.permutation(total)[:keep]
+                    idx.sort()
+                    self.paths = [self.paths[i] for i in idx]
+                    try:
+                        print(f"LipBengal[{self.mode}] subset: {keep}/{total} (~{self.subset_fraction*100:.1f}%)")
+                    except Exception:
+                        pass
 
         # Video preprocessing (grayscale + normalize), optional augment at end
         self.video_preprocessing = torchvision.transforms.Compose([
@@ -898,11 +1012,10 @@ class LipBengal(Dataset):
         ])
 
     def __len__(self):
-        return len(self.paths)
+        return len(self.items) if hasattr(self, "items") else len(self.paths)
 
-    def _load_frames(self, clip_dir):
-        # List jpg frames sorted lexicographically (zero-padded names)
-        frame_files = sorted(glob.glob(os.path.join(clip_dir, "*.jpg")))
+    def _stack_frames(self, frame_files):
+        # Optionally limit number of frames first
         if self.num_frames is not None and len(frame_files) > self.num_frames:
             frame_files = frame_files[: self.num_frames]
         frames = []
@@ -910,77 +1023,152 @@ class LipBengal(Dataset):
             img = torchvision.io.read_image(fp)  # (C, H, W), uint8
             frames.append(img)
         if len(frames) == 0:
-            # Return a dummy single-frame black image if missing
             frames = [torch.zeros(3, 88, 88, dtype=torch.uint8)]
+
+        # Enforce fixed length by truncating/padding (repeat last frame) if requested
+        if isinstance(self.fixed_frames, int) and self.fixed_frames > 0:
+            T = len(frames)
+            if T >= self.fixed_frames:
+                frames = frames[: self.fixed_frames]
+            else:
+                last = frames[-1]
+                frames = frames + [last] * (self.fixed_frames - T)
+
         video = torch.stack(frames, dim=0)  # (T, C, H, W)
         video = video.permute(1, 0, 2, 3)   # (C, T, H, W)
         return video
 
-    def __getitem__(self, n):
-        clip_dir = self.paths[n]
-        # Label is word directory name
-        word = os.path.basename(clip_dir)
-        label = torch.tensor(self.class_dict[word], dtype=torch.long)
+    def _load_frames(self, clip_dir):
+        frame_files = sorted(glob.glob(os.path.join(clip_dir, "*.jpg")))
+        return self._stack_frames(frame_files)
 
-        # Load frames and preprocess
-        video = self._load_frames(clip_dir)
+    def __getitem__(self, n):
+        if hasattr(self, "items"):
+            entry = self.items[n]
+            word = entry["word"]
+            label = torch.tensor(self.class_dict[word], dtype=torch.long)
+            # Prefer prepared aligned crops if available
+            prepared_path = entry.get("prepared")
+            # If not provided in indices, try to infer it from frames via hashing and indices_path split
+            if not prepared_path and self.indices_path and entry.get("frames") and entry.get("speaker"):
+                try:
+                    # Hash function identical to prepare script (_hash_item)
+                    h = hashlib.sha1()
+                    # Canonicalize paths to relative 'datasets/LipBengal/...' to match prepared-file hashing
+                    for pth in entry["frames"]:
+                        try:
+                            idx = pth.find("datasets/LipBengal/")
+                            if idx != -1:
+                                canon = pth[idx:]
+                            else:
+                                canon = pth
+                        except Exception:
+                            canon = pth
+                        h.update(canon.encode("utf-8"))
+                    digest = h.hexdigest()[:16]
+                    # Infer split name from indices_path (train/val/test)
+                    base = os.path.basename(self.indices_path)
+                    split = os.path.splitext(base)[0]
+                    speaker = entry.get("speaker")
+                    fs_word = os.path.basename(os.path.dirname(entry["frames"][0])) if entry.get("frames") else None
+                    cand1 = os.path.join(self.root, "LipBengal", "prepared", split, speaker, word, f"{digest}.pt") if speaker and word else None
+                    cand2 = os.path.join(self.root, "LipBengal", "prepared", split, speaker, fs_word, f"{digest}.pt") if speaker and fs_word else None
+                    # Prefer Banglish folder if present, else fallback to Bengali FS name
+                    for cand in (cand1, cand2):
+                        if cand and os.path.isfile(cand):
+                            prepared_path = cand
+                            break
+                except Exception:
+                    pass
+            if prepared_path and os.path.isfile(prepared_path):
+                obj = torch.load(prepared_path, map_location="cpu")
+                # Supported formats:
+                #  - {"frames": uint8 tensor (T, H, W)} from our prepare script
+                #  - {"x": float tensor (T, H, W)} from earlier draft
+                if isinstance(obj, dict) and "frames" in obj:
+                    x = obj["frames"]  # (T, H, W) uint8
+                    if isinstance(x, np.ndarray):
+                        x = torch.from_numpy(x)
+                    # to (C=1, T, H, W) float in [0,1]
+                    video = x.unsqueeze(0).permute(0, 1, 2, 3).to(torch.float32) / 255.0
+                elif isinstance(obj, dict) and "x" in obj:
+                    x = obj["x"]  # (T, H, W) float maybe normalized
+                    if isinstance(x, np.ndarray):
+                        x = torch.from_numpy(x)
+                    # If looks already normalized to [-1,1], shift back to [0,1] before NormalizeVideo
+                    # Otherwise assume [0,1]. We won't rescale; NormalizeVideo can handle both.
+                    video = x.unsqueeze(0).permute(0, 1, 2, 3).to(torch.float32)
+                else:
+                    # Fallback to frames
+                    frame_files = entry.get("frames", [])
+                    video = self._stack_frames(frame_files)
+                # Enforce fixed length if requested
+                if isinstance(self.fixed_frames, int) and self.fixed_frames > 0:
+                    C, T, H, W = video.shape
+                    if T > self.fixed_frames:
+                        idx = torch.linspace(0, T - 1, steps=self.fixed_frames).round().long()
+                        video = video.index_select(1, idx)
+                    elif T < self.fixed_frames:
+                        pad = video[:, -1:, :, :].expand(C, self.fixed_frames - T, H, W).clone()
+                        video = torch.cat([video, pad], dim=1)
+            else:
+                frame_files = entry.get("frames", [])
+                # Attempt to infer prepared path on the fly if not set
+                if self.indices_path and entry.get("speaker") and frame_files:
+                    try:
+                        h = hashlib.sha1()
+                        for pth in frame_files:
+                            try:
+                                idx = pth.find("datasets/LipBengal/")
+                                if idx != -1:
+                                    canon = pth[idx:]
+                                else:
+                                    canon = pth
+                            except Exception:
+                                canon = pth
+                            h.update(canon.encode("utf-8"))
+                        digest = h.hexdigest()[:16]
+                        base = os.path.basename(self.indices_path)
+                        split = os.path.splitext(base)[0]
+                        speaker = entry.get("speaker")
+                        word_idx = entry.get("word")
+                        fs_word = os.path.basename(os.path.dirname(frame_files[0]))
+                        cand1 = os.path.join(self.root, "LipBengal", "prepared", split, speaker, word_idx or "", f"{digest}.pt") if speaker and word_idx else None
+                        cand2 = os.path.join(self.root, "LipBengal", "prepared", split, speaker, fs_word or "", f"{digest}.pt") if speaker and fs_word else None
+                        use = None
+                        for cand in (cand1, cand2):
+                            if cand and os.path.isfile(cand):
+                                use = cand
+                                break
+                        if use:
+                            prepared_path = use
+                            obj = torch.load(prepared_path, map_location="cpu")
+                            if isinstance(obj, dict) and "frames" in obj:
+                                x = obj["frames"]
+                                if isinstance(x, np.ndarray):
+                                    x = torch.from_numpy(x)
+                                video = x.unsqueeze(0).permute(0, 1, 2, 3).to(torch.float32) / 255.0
+                            elif isinstance(obj, dict) and "x" in obj:
+                                x = obj["x"]
+                                if isinstance(x, np.ndarray):
+                                    x = torch.from_numpy(x)
+                                video = x.unsqueeze(0).permute(0, 1, 2, 3).to(torch.float32)
+                            else:
+                                video = self._stack_frames(frame_files)
+                        else:
+                            video = self._stack_frames(frame_files)
+                    except Exception:
+                        video = self._stack_frames(frame_files)
+                else:
+                    video = self._stack_frames(frame_files)
+        else:
+            clip_dir = self.paths[n]
+            # Label is word directory name
+            word = os.path.basename(clip_dir)
+            label = torch.tensor(self.class_dict[word], dtype=torch.long)
+            # Load frames and preprocess
+            video = self._load_frames(clip_dir)
         video = self.video_preprocessing(video)
 
         # Return as (video, None, label) to mirror LRW triple layout
         return video, None, label
-
-    def download(self):
-
-        # Print
-        print("Download dataset")
-        os.makedirs(os.path.join(self.root, "LRW"), exist_ok=True)
-
-        # Download Pretrain
-        self.download_file(
-            url="https://thor.robots.ox.ac.uk/~vgg/data/lip_reading/data1/lrw-v1-partaa",
-            path=os.path.join(self.root, "LRW", "lrw-v1-partaa")
-        )
-        self.download_file(
-            url="https://thor.robots.ox.ac.uk/~vgg/data/lip_reading/data1/lrw-v1-partab",
-            path=os.path.join(self.root, "LRW", "lrw-v1-partab")
-        )
-        self.download_file(
-            url="https://thor.robots.ox.ac.uk/~vgg/data/lip_reading/data1/lrw-v1-partac",
-            path=os.path.join(self.root, "LRW", "lrw-v1-partac")
-        )
-        self.download_file(
-            url="https://thor.robots.ox.ac.uk/~vgg/data/lip_reading/data1/lrw-v1-partad",
-            path=os.path.join(self.root, "LRW", "lrw-v1-partad")
-        )
-        self.download_file(
-            url="https://thor.robots.ox.ac.uk/~vgg/data/lip_reading/data1/lrw-v1-partae",
-            path=os.path.join(self.root, "LRW", "lrw-v1-partae")
-        )
-        self.download_file(
-            url="https://thor.robots.ox.ac.uk/~vgg/data/lip_reading/data1/lrw-v1-partaf",
-            path=os.path.join(self.root, "LRW", "lrw-v1-partaf")
-        )
-        self.download_file(
-            url="https://thor.robots.ox.ac.uk/~vgg/data/lip_reading/data1/lrw-v1-partag",
-            path=os.path.join(self.root, "LRW", "lrw-v1-partag")
-        )
-        os.system("cat " + os.path.join(self.root, "LRW", "lrw-v1*") + " > " +  os.path.join(self.root, "LRW", "lrw-v1.tar"))
-        extract_archive(
-            from_path=os.path.join(self.root, "LRW", "lrw-v1.tar"),
-            to_path=os.path.join(self.root, "LRW")
-        )   
-
-        # Download Landmarks from https://github.com/mpc001/Lipreading_using_Temporal_Convolutional_Networks
-        gdown.download("https://drive.google.com/uc?id=12mHlNQKCE2AXkFHzvRyqSbsmOMEs259i", os.path.join(self.root, "LRW", "LRW_landmarks.zip"), quiet=False)
-        extract_archive(
-            from_path=os.path.join(self.root, "LRW", "LRW_landmarks.zip"),
-            to_path=os.path.join(self.root, "LRW")
-        )   
-
-    def download_file(self, url, path):
-
-        # Download, Open and Write
-        with requests.get(url, auth=(os.getenv("LRW_USERNAME"), os.getenv("LRW_PASSWORD")), stream=True) as r:
-            with open(path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024):
-                    f.write(chunk)

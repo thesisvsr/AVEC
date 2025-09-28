@@ -88,6 +88,16 @@ Models can be evaluated by selecting the evaluation mode and by providing a chec
 python main.py --config_file configs/config_file.py --checkpoint checkpoint.ckpt --mode evaluation
 ```
 
+## Live camera evaluation
+
+Capture a short clip with your laptop webcam, run the LipBengal preprocessing pipeline, and print the top-5 VisualCE predictions:
+
+```
+python scripts/capture_and_eval.py --preview
+```
+
+The script records a 2-second clip after a brief countdown, stores an optional prepared tensor, and loads the most recent checkpoint from `callbacks/LipBengal/AV/VisualCE`. Use `--checkpoint /path/to/checkpoint.ckpt` to override the checkpoint and `--no-mediapipe` if MediaPipe isn't installed.
+
 ## Options
 
 

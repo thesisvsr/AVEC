@@ -36,6 +36,20 @@ def main(rank, args):
     # Process rank
     args.rank = rank
 
+    # Enable backend performance features early
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        # Allow TF32 on matmul/convs (safe for training by default in many vision models)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # For PyTorch 2.0+: control matmul precision for float32 ops
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
     # Print Mode
     if args.rank == 0:
         print("Mode: {}".format(args.mode))
@@ -85,7 +99,11 @@ def main(rank, args):
             dist_log=args.dist_log,
             grad_init_scale=getattr(args.config, "grad_init_scale", 65536.0),
             detect_anomaly=getattr(args.config, "detect_anomaly", args.detect_anomaly),
-            recompute_metrics=getattr(args.config, "recompute_metrics", False)
+            recompute_metrics=getattr(args.config, "recompute_metrics", False),
+            early_stopping_metric=getattr(args.config, "early_stopping_metric", args.early_stopping_metric),
+            early_stopping_mode=getattr(args.config, "early_stopping_mode", args.early_stopping_mode),
+            early_stopping_patience=getattr(args.config, "early_stopping_patience", args.early_stopping_patience),
+            early_stopping_min_delta=getattr(args.config, "early_stopping_min_delta", args.early_stopping_min_delta)
         )
 
     # Evaluation
@@ -159,6 +177,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size_eval",            type=int,   default=None,                                       help="Evaluation batch size")
     parser.add_argument("--verbose_eval",               type=int,   default=0,                                          help="Evaluation verbose level")
     parser.add_argument("--eval_steps",                 type=int,   default=None,                                       help="Number of evaluation steps")
+
+    # Early Stopping
+    parser.add_argument("--early_stopping_metric",      type=str,   default=None,                                       help="Metric name to monitor for early stopping (e.g., 'wer', 'cer', 'acc')")
+    parser.add_argument("--early_stopping_mode",        type=str,   default="min",                                     help="Direction for early stopping: 'min' or 'max'")
+    parser.add_argument("--early_stopping_patience",    type=int,   default=10,                                         help="Number of eval epochs without improvement before stopping")
+    parser.add_argument("--early_stopping_min_delta",   type=float, default=0.0,                                        help="Minimum change in the monitored metric to qualify as improvement")
 
     # Info
     parser.add_argument("--show_dict",                  action="store_true",                                            help="Show model dict summary")

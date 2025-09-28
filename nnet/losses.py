@@ -257,14 +257,15 @@ class HuberLoss(nn.Module):
 
 class SoftmaxCrossEntropy(nn.Module):
 
-    def __init__(self, ignore_index=-1, transpose_logits=False, reduction='mean'):
+    def __init__(self, ignore_index=-1, transpose_logits=False, reduction='mean', label_smoothing: float = 0.0):
         super(SoftmaxCrossEntropy, self).__init__()
 
         # Params
         self.transpose_logits = transpose_logits
-
+        self.label_smoothing = float(label_smoothing)
+        
         # Loss
-        self.loss = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none')
+        self.loss = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none', label_smoothing=self.label_smoothing)
 
         # Reduction
         self.reduction = Reduction(reduction)

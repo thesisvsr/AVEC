@@ -17,6 +17,8 @@
 !/nnet/**
 !/configs/
 !/configs/**
+!/scripts/
+!/scripts/**
 !/configs/LipBengal/
 !/configs/LipBengal/**
 

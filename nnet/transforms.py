@@ -16,23 +16,35 @@
 import torch
 import torch.nn as nn
 import torchaudio
+import random
 
 # Other
 import numpy as np
 import collections 
 import skimage.transform
 import sys
+from pathlib import Path
 
-# Face Detectors
+# Make sure local 'face_detection/ibug' package is importable when running from repo
+try:
+    _REPO_ROOT = Path(__file__).resolve().parent.parent
+    _FDIR = _REPO_ROOT / "face_detection"
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+    if _FDIR.is_dir() and str(_FDIR) not in sys.path:
+        sys.path.insert(0, str(_FDIR))
+except Exception:
+    pass
+
+# Face Detectors (optional; keep import silent if unavailable)
 try:
     from ibug.face_detection import RetinaFacePredictor
-except Exception as e:
-    print(e)
+except Exception:
+    RetinaFacePredictor = None  # type: ignore
 try:
-    from ibug.face_alignment import FANPredictor
-except Exception as e:
-    FANPredictor = None  # allow rest of code to import
-    print("Warning: ibug.face_alignment (FANPredictor) not available - lip landmark features will be disabled. Install with `pip install ibug-face-alignment`.")
+    from ibug.face_alignment import FANPredictor  # type: ignore
+except Exception:
+    FANPredictor = None  # type: ignore
 
 ###############################################################################
 # Transforms
@@ -65,6 +77,87 @@ class DenormalizeVideo(nn.Module):
         x = x * self.std + self.mean
 
         return x
+
+class RandomCropVideo(nn.Module):
+
+    """Apply a spatial random crop consistently across all frames of a video tensor.
+
+    Expects input shape (C, T, H, W). Returns cropped (C, T, h, w).
+    """
+
+    def __init__(self, size):
+        super().__init__()
+        if isinstance(size, int):
+            size = (size, size)
+        self.size = size  # (h, w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        C, T, H, W = x.shape
+        th, tw = self.size
+        if th == H and tw == W:
+            return x
+        if th > H or tw > W:
+            # Fallback: center crop if requested larger than available
+            i = max((H - th) // 2, 0)
+            j = max((W - tw) // 2, 0)
+        else:
+            i = random.randint(0, H - th)
+            j = random.randint(0, W - tw)
+        return x[:, :, i:i+th, j:j+tw]
+
+class RandomHorizontalFlipVideo(nn.Module):
+
+    """Horizontal flip with probability p for video tensor (C, T, H, W)."""
+
+    def __init__(self, p: float = 0.5):
+        super().__init__()
+        self.p = float(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if random.random() < self.p:
+            return torch.flip(x, dims=(-1,))
+        return x
+
+class RandomTemporalShift(nn.Module):
+
+    """Randomly circularly shift video frames along time by up to max_shift.
+
+    This simulates slight misalignment without changing content. Expects (C, T, H, W).
+    """
+
+    def __init__(self, max_shift: int = 2):
+        super().__init__()
+        self.max_shift = int(max_shift)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.max_shift <= 0:
+            return x
+        C, T, H, W = x.shape
+        if T <= 1:
+            return x
+        s = random.randint(-self.max_shift, self.max_shift)
+        if s == 0:
+            return x
+        return torch.roll(x, shifts=s, dims=1)
+
+class CenterCropVideo(nn.Module):
+
+    """Center crop for video tensor (C, T, H, W)."""
+
+    def __init__(self, size):
+        super().__init__()
+        if isinstance(size, int):
+            size = (size, size)
+        self.size = size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        C, T, H, W = x.shape
+        th, tw = self.size
+        if th >= H and tw >= W:
+            return x
+        i = max((H - th) // 2, 0)
+        j = max((W - tw) // 2, 0)
+        return x[:, :, i:i+th, j:j+tw]
 
 def video_to_images(videos):
 
@@ -206,7 +299,8 @@ class LipDetectCrop(nn.Module):
         
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         try:
-            self.face_detector = RetinaFacePredictor(device=device, threshold=0.8, model=RetinaFacePredictor.get_model('resnet50')) if 'RetinaFacePredictor' in globals() else None
+            # Relax threshold to reduce missed detections on LipBengal; LRS2 often used 0.6-0.7
+            self.face_detector = RetinaFacePredictor(device=device, threshold=0.6, model=RetinaFacePredictor.get_model('resnet50')) if 'RetinaFacePredictor' in globals() else None
             self.landmark_detector = FANPredictor(device=device, model=None) if FANPredictor is not None else None
         except Exception:
             self.face_detector = None
@@ -224,6 +318,7 @@ class LipDetectCrop(nn.Module):
                 video_landmarks.append(None)
                 continue
             detected_faces = self.face_detector(frame, rgb=True)
+            # Pass detected face boxes to FANPredictor to guide landmarking
             landmarks, scores = self.landmark_detector(frame, detected_faces, rgb=True)
             if len(landmarks) > 0:
                 video_landmarks.append(landmarks[0])

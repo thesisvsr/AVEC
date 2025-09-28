@@ -55,6 +55,8 @@ class Model(Module):
         self.ema_model = None
         self.ema_tau = 0.0
         self.grad_max_norm = None
+        # Optional debug: print a few decoded predictions vs targets after eval
+        self.preview_samples_per_epoch = 5
 
     def distribute_strategy(self, rank, sync_batch_norm=True):
         if sync_batch_norm:
@@ -75,6 +77,11 @@ class Model(Module):
         object.__setattr__(self, "ema_model", copy.deepcopy(self))
         self.set_require_grad(self.ema_model, False)
         self.ema_model.eval()
+        # Ensure EMA model is on the same device as main model (if already moved)
+        try:
+            self.ema_model.to(self.device)
+        except Exception:
+            pass
         self.ema_tau = ema_tau
 
     def compile(self, losses, loss_weights=None, optimizer="Adam", metrics=None, decoders=None):
@@ -210,11 +217,26 @@ class Model(Module):
                 if not key in struct:
                     struct[key] = None
 
-        # List
-        elif isinstance(struct, list):
+        # List or Tuple
+        elif isinstance(struct, (list, tuple)):
 
-            # Map list items to outputs, Fill missing items with None, Ignore extra items
-            struct = {key: struct[i] if i < len(struct) else None for i, key in enumerate(outputs)}
+            # Special-case: if this looks like CTC targets (labels, lengths) provided as a 2-item list/tuple of tensors,
+            # then map the SAME PAIR to all outputs keys (do not split across keys by index).
+            # This ensures losses like CTCLoss receive (y, y_len) together for the desired head(s).
+            try:
+                is_pair = (
+                    len(struct) == 2 and
+                    torch.is_tensor(struct[0]) and torch.is_tensor(struct[1])
+                )
+            except Exception:
+                is_pair = False
+
+            if is_pair:
+                pair = tuple(struct)
+                struct = {key: pair for key in outputs}
+            else:
+                # Map list/tuple items to outputs, Fill missing items with None, Ignore extra items
+                struct = {key: struct[i] if i < len(struct) else None for i, key in enumerate(outputs)}
 
         # Module / Tensor / tuple
         else:
@@ -311,6 +333,14 @@ class Model(Module):
                     if decoder != None:
                         batch_truths[key_metric] = decoder(targets[key], from_logits=False) if targets[key] != None else None
                         batch_preds[key_metric] = decoder(outputs[key])
+                        # Collect decoder telemetry if available (e.g., adaptive routing/latency)
+                        try:
+                            last_stats = getattr(decoder, "last_stats", None)
+                            if isinstance(last_stats, dict):
+                                for _k, _v in last_stats.items():
+                                    self.add_info(_k, _v)
+                        except Exception:
+                            pass
                     else:
                         batch_truths[key_metric] = targets[key]
                         batch_preds[key_metric] = outputs[key]
@@ -400,6 +430,14 @@ class Model(Module):
 
         # Update Exp Moving Avg Model
         if self.ema_model != None:
+            # Make sure both models are on the same device as parameters being updated
+            # Prefer the device of the first parameter of the main model
+            try:
+                first_param_dev = next(self.parameters()).device
+            except Exception:
+                first_param_dev = self.device
+            if any(p.device != first_param_dev for p in self.ema_model.parameters()):
+                self.ema_model.to(first_param_dev)
             for param_target, param_net in zip(self.ema_model.parameters(), self.parameters()):
                 param_target.mul_(self.ema_tau)
                 param_target.add_((1 - self.ema_tau) * param_net.detach())
@@ -544,17 +582,23 @@ class Model(Module):
             print("Rank {}: Model loaded at step {}".format(self.rank, self.model_step))
 
     def on_epoch_end(self, evaluate, save, log_figure, callback_path, epoch, inputs, targets, dataset_eval, eval_steps, verbose_eval, writer, recompute_metrics):
-        self.on_step_end(evaluate, save, log_figure, callback_path, epoch, epoch, inputs, targets, dataset_eval, eval_steps, verbose_eval, writer, recompute_metrics, tag="epoch")
+        eval_results = self.on_step_end(
+            evaluate, save, log_figure, callback_path, epoch, epoch, inputs, targets, dataset_eval, eval_steps, verbose_eval, writer, recompute_metrics, tag="epoch"
+        )
 
         # Print
         if self.rank == 0:
             print()
 
+        # Return evaluation results for potential early stopping logic
+        return eval_results
+
     def on_step_end(self, evaluate, save, log_figure, callback_path, epoch, step, inputs, targets, dataset_eval, eval_steps, verbose_eval, writer, recompute_metrics, tag="step"):
 
         # Evaluate Model
+        eval_results = None
         if evaluate:
-            self._evaluate(dataset_eval, writer, step, eval_steps, verbose_eval, recompute_metrics, tag="Evaluation-" + tag)
+            eval_results = self._evaluate(dataset_eval, writer, step, eval_steps, verbose_eval, recompute_metrics, tag="Evaluation-" + tag)
             self.train()
 
         # Save Checkpoint
@@ -566,6 +610,9 @@ class Model(Module):
             self.eval()
             self.log_figure(step, inputs, targets, writer, tag)
             self.train()
+
+        # Return eval results so caller can act (e.g., early stopping)
+        return eval_results
 
     def log_figure(self, step, inputs, targets, writer, tag): 
         pass
@@ -665,7 +712,8 @@ class Model(Module):
 
         return truths, preds
 
-    def fit(self, dataset_train, epochs, dataset_eval=None, eval_steps=None, verbose_eval=0, initial_epoch=0, callback_path=None, steps_per_epoch=None, precision=torch.float32, accumulated_steps=1, eval_period_step=None, eval_period_epoch=1, saving_period_step=None, saving_period_epoch=1, log_figure_period_step=None, log_figure_period_epoch=1, step_log_period=10, eval_training=True, dist_log=False, grad_init_scale=65536.0, detect_anomaly=False, recompute_metrics=False):
+    def fit(self, dataset_train, epochs, dataset_eval=None, eval_steps=None, verbose_eval=0, initial_epoch=0, callback_path=None, steps_per_epoch=None, precision=torch.float32, accumulated_steps=1, eval_period_step=None, eval_period_epoch=1, saving_period_step=None, saving_period_epoch=1, log_figure_period_step=None, log_figure_period_epoch=1, step_log_period=10, eval_training=True, dist_log=False, grad_init_scale=65536.0, detect_anomaly=False, recompute_metrics=False,
+        early_stopping_metric: str = None, early_stopping_mode: str = "min", early_stopping_patience: int = 10, early_stopping_min_delta: float = 0.0):
 
         # Is Compiled
         if not self.compiled:
@@ -701,6 +749,12 @@ class Model(Module):
 
         # Try Catch
         try:
+
+            # Early stopping trackers
+            if early_stopping_metric is not None:
+                best_score = None
+                best_epoch = initial_epoch
+                patience_ctr = 0
 
             # Training Loop
             for epoch in range(initial_epoch, epochs):
@@ -801,7 +855,7 @@ class Model(Module):
                     self.log_step(epoch_losses, epoch_metrics, {}, writer, epoch + 1, "Training-epoch")
 
                 # On Epoch End
-                self.on_epoch_end(
+                eval_results = self.on_epoch_end(
                     evaluate=(epoch + 1) % eval_period_epoch == 0 if eval_period_epoch != None else False,
                     save=(epoch + 1) % saving_period_epoch == 0 if saving_period_epoch != None else False, 
                     log_figure=(epoch + 1) % log_figure_period_epoch == 0 if log_figure_period_epoch != None else False, 
@@ -816,6 +870,39 @@ class Model(Module):
                     recompute_metrics=recompute_metrics
                 )
 
+                # Early stopping check on epoch boundaries (if we evaluated)
+                if early_stopping_metric is not None and eval_results is not None:
+                    # Use first eval dataset as primary signal
+                    try:
+                        primary = eval_results[0]
+                        metrics = primary.get("metrics", {})
+                        # metric tensors -> float
+                        current = metrics.get(early_stopping_metric, None)
+                        if current is not None and hasattr(current, 'item'):
+                            current = float(current.item())
+                        if current is not None:
+                            if best_score is None:
+                                best_score = current
+                                best_epoch = epoch
+                                patience_ctr = 0
+                            else:
+                                improved = (current < best_score - early_stopping_min_delta) if early_stopping_mode == "min" else (current > best_score + early_stopping_min_delta)
+                                if improved:
+                                    best_score = current
+                                    best_epoch = epoch
+                                    patience_ctr = 0
+                                else:
+                                    patience_ctr += 1
+                                    if self.rank == 0:
+                                        print(f"EarlyStopping: no improvement in '{early_stopping_metric}' (best={best_score:.4f}) for {patience_ctr}/{early_stopping_patience} epochs.")
+                                    if patience_ctr >= early_stopping_patience:
+                                        if self.rank == 0:
+                                            print(f"EarlyStopping: stopping at epoch {epoch+1}; best {early_stopping_metric}={best_score:.4f} at epoch {best_epoch+1}.")
+                                        break
+                    except Exception:
+                        # If anything goes wrong, skip early stopping silently
+                        pass
+
         # Exception Handler
         except Exception as e:
 
@@ -827,6 +914,11 @@ class Model(Module):
 
             raise e
 
+        # Return best epoch (if early stopping was enabled)
+        if early_stopping_metric is not None:
+            return locals().get('best_epoch', epochs-1)
+        return None
+
     def _evaluate(self, dataset, writer, step, eval_steps=None, verbose=0, recompute_metrics=False, tag="Evaluation"):
         
         # Evaluation Dataset
@@ -837,6 +929,7 @@ class Model(Module):
                 dataset = [dataset]
 
             # Eval Datasets loop
+            results = []
             for dataset_i, dataset in enumerate(dataset):
 
                 # Evaluate
@@ -849,6 +942,9 @@ class Model(Module):
                 # Log
                 if self.rank == 0 and writer is not None:
                     self.log_step(val_losses, val_metrics, {}, writer, step, os.path.join(tag, str(dataset_i)))
+
+                # Keep primary eval results (non-EMA)
+                results.append({"losses": val_losses, "metrics": val_metrics})
 
                 # Evaluate EMA model
                 if self.ema_model != None:
@@ -863,6 +959,8 @@ class Model(Module):
                     # Log
                     if self.rank == 0 and writer is not None:
                         self.log_step(val_losses, val_metrics, {}, writer, step, os.path.join(tag + "-ema", str(dataset_i)))
+
+            return results
 
     def evaluate(self, dataset_eval, eval_steps=None, verbose=0, recompute_metrics=False):
 
@@ -886,6 +984,19 @@ class Model(Module):
             eval_iterator = dataset_eval
 
         # Evaluation Loop
+        preview_pairs = []
+        # Aggregate adaptive decoding telemetry across steps
+        adaptive_agg = {
+            "B": 0,
+            "n_greedy": 0,
+            "n_small": 0,
+            "n_large": 0,
+            "latency_ms_greedy": 0.0,
+            "latency_ms_small": 0.0,
+            "latency_ms_large": 0.0,
+            "latency_ms_total": 0.0,
+            "steps": 0,
+        }
         for step, batch in enumerate(eval_iterator):
 
             # Unpack Batch
@@ -909,9 +1020,53 @@ class Model(Module):
                 for key, value in batch_preds.items():
                     epoch_preds[key] = epoch_preds[key] + value if key in epoch_preds else value
 
+            # Collect a few preview samples (decoded text vs truth) if available
+            # Prefer metrics that use decoders (e.g., WER/CER) where truths/preds are list[str]
+            if self.rank == 0 and len(preview_pairs) < self.preview_samples_per_epoch:
+                keys = list(batch_truths.keys())
+                chosen_key = None
+                # 1) Prefer keys that look like word/char error rate
+                for k in keys:
+                    if any(s in k.lower() for s in ["wer", "cer", "word", "char"]):
+                        truths = batch_truths.get(k)
+                        preds = batch_preds.get(k)
+                        if isinstance(truths, list) and isinstance(preds, list):
+                            chosen_key = k
+                            break
+                # 2) Fallback: first key whose truths/preds are list[str]
+                if chosen_key is None:
+                    for k in keys:
+                        truths = batch_truths.get(k)
+                        preds = batch_preds.get(k)
+                        if isinstance(truths, list) and isinstance(preds, list):
+                            chosen_key = k
+                            break
+                if chosen_key is not None:
+                    truths = batch_truths[chosen_key]
+                    preds = batch_preds[chosen_key]
+                    for t, p in zip(truths, preds):
+                        preview_pairs.append((t, p))
+                        if len(preview_pairs) >= self.preview_samples_per_epoch:
+                            break
+
             # Step print (Rank 0)
             if self.rank == 0:
                 self.display_step(epoch_losses, epoch_metrics, self.infos, eval_iterator, step + 1)
+
+            # Aggregate adaptive telemetry for this step if present
+            try:
+                if any(k.startswith("adaptive/") for k in self.infos.keys()):
+                    adaptive_agg["B"] += int(self.infos.get("adaptive/B", 0) or 0)
+                    adaptive_agg["n_greedy"] += int(self.infos.get("adaptive/n_greedy", 0) or 0)
+                    adaptive_agg["n_small"] += int(self.infos.get("adaptive/n_small", 0) or 0)
+                    adaptive_agg["n_large"] += int(self.infos.get("adaptive/n_large", 0) or 0)
+                    adaptive_agg["latency_ms_greedy"] += float(self.infos.get("adaptive/latency_ms_greedy", 0.0) or 0.0)
+                    adaptive_agg["latency_ms_small"] += float(self.infos.get("adaptive/latency_ms_small", 0.0) or 0.0)
+                    adaptive_agg["latency_ms_large"] += float(self.infos.get("adaptive/latency_ms_large", 0.0) or 0.0)
+                    adaptive_agg["latency_ms_total"] += float(self.infos.get("adaptive/latency_ms_total", 0.0) or 0.0)
+                    adaptive_agg["steps"] += 1
+            except Exception:
+                pass
 
             # Evaluation Steps
             if eval_steps:
@@ -932,12 +1087,60 @@ class Model(Module):
 
         # Recompute Metrics
         if recompute_metrics:
-            for key in epoch_metrics.keys():
-                epoch_metrics[key] = self.metrics["outputs"](epoch_truths[key], epoch_preds[key]) # fix metrics key
+            # Recompute each metric using aggregated truths/preds.
+            # Support both single metric and list of metrics on the 'outputs' head.
+            name_to_metric = {}
+            try:
+                metrics_struct = self.metrics.get("outputs", None)
+            except Exception:
+                metrics_struct = None
+            if isinstance(metrics_struct, list):
+                for m in metrics_struct:
+                    try:
+                        name_to_metric[m.name] = m
+                    except Exception:
+                        pass
+            elif metrics_struct is not None:
+                try:
+                    name_to_metric[metrics_struct.name] = metrics_struct
+                except Exception:
+                    pass
+
+            for key in list(epoch_truths.keys()):
+                metric_obj = name_to_metric.get(key)
+                if metric_obj is None and name_to_metric:
+                    # Fallback to first available metric if names don't match
+                    metric_obj = list(name_to_metric.values())[0]
+                if metric_obj is not None:
+                    epoch_metrics[key] = metric_obj(epoch_truths[key], epoch_preds[key])
         # Mean Metrics
         else:
             for key, value in epoch_metrics.items():
                 epoch_metrics[key] = value / (eval_steps if eval_steps is not None else len(dataset_eval))
+
+        # Print a compact preview of predictions vs ground truths (rank 0)
+        if self.rank == 0 and preview_pairs:
+            print("\nPreview (pred vs true):")
+            for i, (t, p) in enumerate(preview_pairs):
+                print(f"  [{i+1}] pred: {p} | true: {t}")
+
+        # Print aggregated adaptive telemetry summary
+        if self.rank == 0 and adaptive_agg["steps"] > 0:
+            total_utts = adaptive_agg["B"]
+            n_g, n_s, n_l = adaptive_agg["n_greedy"], adaptive_agg["n_small"], adaptive_agg["n_large"]
+            def pct(x):
+                return 100.0 * (x / max(total_utts, 1))
+            # Mean per-utterance latency by tier (only over routed items)
+            mean_g = adaptive_agg["latency_ms_greedy"] / max(n_g, 1)
+            mean_s = adaptive_agg["latency_ms_small"] / max(n_s, 1)
+            mean_l = adaptive_agg["latency_ms_large"] / max(n_l, 1)
+            mean_total_per_step = adaptive_agg["latency_ms_total"] / adaptive_agg["steps"]
+            print("\nAdaptive decoding summary (aggregated):")
+            print(f"  total_utterances: {total_utts}")
+            print(f"  routed_greedy: {n_g} ({pct(n_g):.1f}%)  mean_ms_greedy_per_utt: {mean_g:.2f}")
+            print(f"  routed_small:  {n_s} ({pct(n_s):.1f}%)  mean_ms_small_per_utt:  {mean_s:.2f}")
+            print(f"  routed_large:  {n_l} ({pct(n_l):.1f}%)  mean_ms_large_per_utt:  {mean_l:.2f}")
+            print(f"  mean_total_latency_ms_per_step: {mean_total_per_step:.2f}")
 
         return epoch_losses, epoch_metrics
 

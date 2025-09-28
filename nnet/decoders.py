@@ -24,11 +24,12 @@ import importlib
 # Neural Nets
 from nnet.module import Module
 
-# CTC Decode
+# CTC Decode (optional)
 try:
     from ctcdecode import CTCBeamDecoder
-except Exception as e:
-    print(e)
+except Exception:
+    # Leave unavailable silently; we'll raise a clear error if a CTC beam search is actually requested.
+    CTCBeamDecoder = None  # type: ignore
 
 ###############################################################################
 # Decoders
@@ -73,6 +74,51 @@ class ArgMaxDecoder(nn.Module):
             tokens = outputs.tolist()
 
         return tokens
+
+class ClassLabelToWordDecoder(nn.Module):
+
+    """
+    Decoder for classification (CE) models where outputs are class logits.
+    - When from_logits=True: take argmax over classes and map indices to word strings.
+    - When from_logits=False: inputs are integer class indices; map directly to word strings.
+
+    Returns a Python list of strings (one per batch element), suitable for jiwer WER.
+    """
+
+    def __init__(self, words):
+        super(ClassLabelToWordDecoder, self).__init__()
+        # words: list[str] of length V where index aligns with class id
+        self.words = list(words)
+
+    def forward(self, outputs, from_logits=True):
+        # outputs: (B, V) logits if from_logits else (B,) integer class ids
+        if from_logits:
+            if isinstance(outputs, (list, tuple)):
+                # Safety: accept a single tensor in a list/tuple
+                outputs = outputs[0]
+            idx = outputs.softmax(dim=-1).argmax(dim=-1).detach().cpu().tolist()
+        else:
+            # Targets should be integer class indices tensor (B,)
+            if torch.is_tensor(outputs):
+                idx = outputs.detach().cpu().tolist()
+            else:
+                idx = list(outputs)
+
+        # Map indices to words with bounds checking
+        decoded = []
+        V = len(self.words)
+        for i in idx:
+            if isinstance(i, (list, tuple)):
+                # Unexpected shape; take first
+                i = i[0]
+            try:
+                if 0 <= int(i) < V:
+                    decoded.append(self.words[int(i)])
+                else:
+                    decoded.append("")
+            except Exception:
+                decoded.append("")
+        return decoded
 
 class CTCGreedySearchDecoder(nn.Module):
 
@@ -174,6 +220,11 @@ class CTCBeamSearchDecoder(Module):
 
     def beam_search(self, logits, logits_len, verbose=False):
 
+        if CTCBeamDecoder is None:
+            raise RuntimeError(
+                "CTCBeamDecoder is unavailable. Install/build ctcdecode or switch to greedy decoding."
+            )
+
         # test_time_aug
         if self.test_time_aug:
             batch_size, num_augments = logits.shape[0], logits.shape[1] # b, Naug
@@ -266,3 +317,236 @@ decoder_dict = {
     "CTCGreedySearchDecoder": CTCGreedySearchDecoder,
     "CTCBeamSearch": CTCBeamSearchDecoder
 }
+
+###############################################################################
+# Adaptive decoding: confidence-gated greedy/beam/LLM
+###############################################################################
+
+class AdaptiveCTCDecoder(nn.Module):
+    """
+    Confidence-adaptive CTC decoding with optional LLM (neural LM) rescoring.
+
+    Strategy per utterance (batch element):
+      - Compute an entropy-based confidence score from AV logits
+      - If low entropy (high confidence): use greedy
+      - If medium entropy: use small beam (no LLM)
+      - If high entropy: use large beam and optionally enable neural LM (distilled LLM) rescoring
+
+    This reduces LM usage and latency by invoking the LLM only when needed.
+
+    Notes/assumptions:
+      - Expects CTC outputs (logits, logits_len)
+      - Entropy computed over non-blank distribution if exclude_blank=True, averaged over valid frames
+      - For mixed decisions in a batch, decoding is run per group and merged back preserving order
+    """
+
+    def __init__(
+        self,
+        tokenizer_path: str,
+        entropy_low: float = 1.2,
+        entropy_high: float = 2.0,
+        small_beam: int = 8,
+        large_beam: int = 32,
+        exclude_blank: bool = True,
+        use_visual_gating: bool = True,
+        # Optional n-gram LM
+        ngram_path: str | None = None,
+        ngram_tmp: float = 1.0,
+        ngram_alpha: float = 0.6,
+        ngram_beta: float = 1.0,
+        ngram_offset: int = 100,
+        num_processes: int = 8,
+        # Optional neural LM (distilled LLM) for large-beam tier only
+        neural_config_path: str | None = None,
+        neural_checkpoint: str | None = None,
+        neural_alpha: float = 0.6,
+        neural_beta: float = 1.0,
+        test_time_aug: bool = False,
+    ):
+        super().__init__()
+        self.tokenizer = spm.SentencePieceProcessor(tokenizer_path)
+        self.blank_id = 0
+        self.use_visual_gating = bool(use_visual_gating)
+
+        # thresholds and beams
+        self.entropy_low = float(entropy_low)
+        self.entropy_high = float(entropy_high)
+        assert self.entropy_low <= self.entropy_high, "entropy_low should be <= entropy_high"
+        self.small_beam = int(small_beam)
+        self.large_beam = int(large_beam)
+        self.exclude_blank = bool(exclude_blank)
+
+        # Greedy and beam decoders (instantiate two CTC beam decoders for small/large)
+        self.greedy = CTCGreedySearchDecoder(tokenizer_path=tokenizer_path, blank_token=self.blank_id)
+        # Beam decoders (if ctcdecode available); otherwise we'll fallback to greedy
+        self._beam_available = CTCBeamDecoder is not None
+        if self._beam_available:
+            self.beam_small = CTCBeamSearchDecoder(
+                tokenizer_path=tokenizer_path,
+                beam_size=self.small_beam,
+                ngram_path=ngram_path,
+                ngram_tmp=ngram_tmp,
+                ngram_alpha=ngram_alpha,
+                ngram_beta=ngram_beta,
+                ngram_offset=ngram_offset,
+                num_processes=num_processes,
+                test_time_aug=test_time_aug,
+            )
+            # Large beam optionally with neural rescorer
+            self.beam_large = CTCBeamSearchDecoder(
+                tokenizer_path=tokenizer_path,
+                beam_size=self.large_beam,
+                ngram_path=ngram_path,
+                ngram_tmp=ngram_tmp,
+                ngram_alpha=ngram_alpha,
+                ngram_beta=ngram_beta,
+                ngram_offset=ngram_offset,
+                num_processes=num_processes,
+                test_time_aug=test_time_aug,
+                neural_config_path=neural_config_path,
+                neural_checkpoint=neural_checkpoint,
+                neural_alpha=neural_alpha,
+                neural_beta=neural_beta,
+            )
+        else:
+            self.beam_small = None
+            self.beam_large = None
+
+    @staticmethod
+    def _avg_entropy(logits: torch.Tensor, lengths: torch.Tensor, blank_id: int = 0, exclude_blank: bool = True) -> torch.Tensor:
+        """Compute average per-frame entropy per batch element.
+
+        logits: (B, T, V)
+        lengths: (B,)
+        Returns: (B,) entropies
+        """
+        with torch.no_grad():
+            probs = logits.softmax(dim=-1)  # (B,T,V)
+            if exclude_blank:
+                # zero-out blank prob and renormalize over non-blank
+                probs = probs.clone()
+                probs[..., blank_id] = 0.0
+                Z = probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                probs = probs / Z
+            # entropy per frame: -sum p log p
+            ent = -(probs.clamp_min(1e-8).log() * probs).sum(dim=-1)  # (B,T)
+            B, T = ent.shape
+            mask = torch.arange(T, device=ent.device).unsqueeze(0) < lengths.view(B, 1)
+            ent_sum = (ent * mask).sum(dim=1)
+            lengths_f = lengths.to(ent.dtype).clamp_min(1.0)
+            return ent_sum / lengths_f
+
+    def forward(self, outputs, from_logits: bool = True):
+        # Expect (logits, lengths) or (logits, lengths, gating_logits, gating_lengths)
+        if not from_logits:
+            # Already token ids: pass-through decode using tokenizer
+            return self.tokenizer.decode(outputs[0].tolist())
+
+        if isinstance(outputs, (list, tuple)) and len(outputs) >= 2:
+            logits, lengths = outputs[0], outputs[1]
+            gating_logits = outputs[2] if len(outputs) >= 3 else None
+            gating_lengths = outputs[3] if len(outputs) >= 4 else None
+        else:
+            logits, lengths = outputs
+            gating_logits, gating_lengths = None, None
+
+        # If test-time augmentation present (B, Naug, T, V), collapse aug dimension by averaging logits
+        if logits.dim() == 4:
+            # (B,N,T,V) -> (B,T,V)
+            logits = logits.mean(dim=1)
+
+        # Compute entropy-based confidence (prefer separate gating source if provided)
+        if gating_logits is not None and gating_lengths is not None:
+            ent = self._avg_entropy(gating_logits, gating_lengths, blank_id=self.blank_id, exclude_blank=self.exclude_blank)
+        else:
+            ent = self._avg_entropy(logits, lengths, blank_id=self.blank_id, exclude_blank=self.exclude_blank)
+
+    # Partition indices
+        idx_greedy = (ent <= self.entropy_low).nonzero(as_tuple=False).view(-1)
+        idx_small = ((ent > self.entropy_low) & (ent <= self.entropy_high)).nonzero(as_tuple=False).view(-1)
+        idx_large = (ent > self.entropy_high).nonzero(as_tuple=False).view(-1)
+
+        # Helper to slice tensors by indices preserving device
+        def _gather(t: torch.Tensor, idx: torch.Tensor):
+            if idx.numel() == 0:
+                return None
+            return t.index_select(0, idx)
+
+        decoded_text = [None] * logits.size(0)
+
+        # Routing/latency stats
+        import time
+        B = int(logits.size(0))
+        stats = {
+            "adaptive/B": B,
+            "adaptive/entropy_mean": float(ent.mean().item()),
+            "adaptive/entropy_low": float(self.entropy_low),
+            "adaptive/entropy_high": float(self.entropy_high),
+            "adaptive/n_greedy": int(idx_greedy.numel()),
+            "adaptive/n_small": int(idx_small.numel()),
+            "adaptive/n_large": int(idx_large.numel()),
+            "adaptive/latency_ms_greedy": 0.0,
+            "adaptive/latency_ms_small": 0.0,
+            "adaptive/latency_ms_large": 0.0,
+            "adaptive/latency_ms_total": 0.0,
+        }
+        t_all = time.perf_counter()
+
+        # Run greedy on low-entropy group
+        if idx_greedy.numel() > 0:
+            t0 = time.perf_counter()
+            out = self.greedy.forward((_gather(logits, idx_greedy), _gather(lengths, idx_greedy)), from_logits=True)
+            for i, s in zip(idx_greedy.tolist(), out):
+                decoded_text[i] = s
+            stats["adaptive/latency_ms_greedy"] = (time.perf_counter() - t0) * 1000.0
+
+        # Run small-beam (no neural LM) on medium-entropy group
+        if idx_small.numel() > 0:
+            t0 = time.perf_counter()
+            if self._beam_available and self.beam_small is not None:
+                out = self.beam_small.forward((_gather(logits, idx_small), _gather(lengths, idx_small)), from_logits=True)
+            else:
+                out = self.greedy.forward((_gather(logits, idx_small), _gather(lengths, idx_small)), from_logits=True)
+            for i, s in zip(idx_small.tolist(), out):
+                decoded_text[i] = s
+            stats["adaptive/latency_ms_small"] = (time.perf_counter() - t0) * 1000.0
+
+        # Run large-beam (with optional neural LM) on high-entropy group
+        if idx_large.numel() > 0:
+            t0 = time.perf_counter()
+            if self._beam_available and self.beam_large is not None:
+                out = self.beam_large.forward((_gather(logits, idx_large), _gather(lengths, idx_large)), from_logits=True)
+            else:
+                out = self.greedy.forward((_gather(logits, idx_large), _gather(lengths, idx_large)), from_logits=True)
+            for i, s in zip(idx_large.tolist(), out):
+                decoded_text[i] = s
+            stats["adaptive/latency_ms_large"] = (time.perf_counter() - t0) * 1000.0
+
+        stats["adaptive/latency_ms_total"] = (time.perf_counter() - t_all) * 1000.0
+        # expose last stats for external consumers (e.g., model logging)
+        try:
+            self.last_stats = stats
+        except Exception:
+            pass
+
+        # Try to attach stats to outer model infos if available
+        try:
+            # Walk up through potential attributes sometimes set by frameworks
+            parent = getattr(self, "_parent_model", None)
+            if parent is None:
+                # Some models might have attached decoders directly on the model
+                # which is a Module with add_info; attempt to find a Module ancestor
+                pass
+            if parent is not None and hasattr(parent, "add_info"):
+                for k, v in stats.items():
+                    parent.add_info(k, v)
+        except Exception:
+            pass
+
+        # All should be filled; fallback to greedy if any None
+        for i in range(len(decoded_text)):
+            if decoded_text[i] is None:
+                decoded_text[i] = self.greedy.forward((logits[i:i+1], lengths[i:i+1]), from_logits=True)[0]
+
+        return decoded_text
+

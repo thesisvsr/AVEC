@@ -173,6 +173,14 @@ class CollateFn(nn.Module):
                 collates.append(collate)
             collates = tuple(collates)
 
-        collates = collates[0] if len(collates) == 1 else collates
+        # For targets: if exactly two items (labels, lengths), return a tuple to preserve (y, y_len)
+        # This helps CTC loss which expects both labels and target_lengths.
+        # If the targets_params was provided as a tuple (e.g., (labels, lengths)),
+        # return a tuple to preserve (y, y_len) structure expected by CTC.
+        if isinstance(self.targets_params, tuple) and collate_params is self.targets_params:
+            # Already a tuple when collated with tuple spec; ensure it's a tuple
+            collates = tuple(collates) if not isinstance(collates, tuple) else collates
+        else:
+            collates = collates[0] if len(collates) == 1 else collates
 
         return collates

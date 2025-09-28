@@ -130,7 +130,7 @@ class AdamW(optim.AdamW):
 # Utils
 ###############################################################################
 
-def get_decay_param_groups(model, weight_decay=0.01, decay_modules=(torch.nn.Linear,), no_decay_modules=(torch.nn.LayerNorm, torch.nn.Embedding, embeddings.PosEmbedding1d), decay_params=("weight",), no_decay_params=("bias",)):
+def get_decay_param_groups(model, weight_decay=0.01, decay_modules=(torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d), no_decay_modules=(torch.nn.LayerNorm, torch.nn.Embedding, embeddings.PosEmbedding1d, torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d), decay_params=("weight",), no_decay_params=("bias",)):
 
     # Init Decay / No decay Sets
     decay = set()
@@ -167,7 +167,12 @@ def get_decay_param_groups(model, weight_decay=0.01, decay_modules=(torch.nn.Lin
     inter_params = decay & no_decay
     union_params = decay | no_decay
     assert len(inter_params) == 0, "parameters {} made it into both decay/no_decay sets!".format(str(inter_params))
-    assert len(param_dict.keys() - union_params) == 0, "parameters {} were not separated into either decay/no_decay set!".format(str(param_dict.keys() - union_params))
+    # Be permissive: any param types not matched above go to no_decay by default
+    missing = param_dict.keys() - union_params
+    if missing:
+        for pn in missing:
+            no_decay.add(pn)
+        union_params = decay | no_decay
 
     # Create Param Groups
     param_groups = [

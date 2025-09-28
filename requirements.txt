@@ -12,3 +12,5 @@ sentencepiece
 scikit-image
 gdown
 av
+face-alignment==1.3.5  # for ibug.face_alignment FANPredictor wrapper
+opencv-python

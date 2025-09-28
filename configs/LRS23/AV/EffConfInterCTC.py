@@ -60,7 +60,9 @@ callback_path = "callbacks/LRS23/AV/EffConfInterCTC"
 # Model
 model = nnet.AudioVisualEfficientConformerInterCTC(vocab_size=vocab_size, v_interctc_blocks=v_interctc_blocks, a_interctc_blocks=a_interctc_blocks, f_interctc_blocks=f_interctc_blocks)
 model.compile(
-    losses=nnet.CTCLoss(zero_infinity=True, assert_shorter=False),
+    losses={
+        "outputs": nnet.CTCLoss(zero_infinity=True, assert_shorter=False)
+    },
     decoders={"outputs": nnet.CTCGreedySearchDecoder(tokenizer_path=tokenizer_path) if not beamsearch else nnet.CTCBeamSearchDecoder(tokenizer_path=tokenizer_path, beam_size=beam_size, ngram_path=ngram_path, ngram_tmp=ngram_tmp, ngram_alpha=ngram_alpha, ngram_beta=ngram_beta, ngram_offset=ngram_offset, neural_config_path=neural_config_path, neural_checkpoint=neural_checkpoint, neural_alpha=neural_alpha, neural_beta=neural_beta)},
     metrics={"outputs": nnet.WordErrorRate()},
     loss_weights=loss_weights

@@ -1,13 +1,11 @@
 import sys
 sys.path.append("../../")
 
-# Imports
 import nnet
 import torch
 import torch.nn as nn
 import torchvision
 
-# Architecture
 vocab_size = 256
 v_interctc_blocks = [3, 6]
 a_interctc_blocks = [8, 11]
@@ -21,69 +19,55 @@ loss_weights={
     "outputs": 0.5
 }
 
-# Pretrained visual front-end from LRW (optional)
-lrw_pretrained = False
-lrw_checkpoint = "callbacks/LRW/EffConfCE/checkpoints_epoch_30_step_57247.ckpt"
-
-# Arch params
-ff_ratio = 4
-conv_stride = 2
-drop_rate = 0.1
-attn_drop_rate = 0.0
-kernel_size = 15
-num_heads = 4
-max_pos_encoding = 10000
-
-# Decoding (LRS2-only, keep it simple: greedy to avoid LM/ctcdecode deps)
-beamsearch = False
-beam_size = 16
 tokenizer_path = "datasets/LRS3/tokenizerbpe256.model"
 
-# Training
 batch_size = 2
 accumulated_steps = 32
 eval_training = False
 precision = torch.float32
 recompute_metrics = True
-callback_path = "callbacks/LRS2/AV/EffConfInterCTC"
+callback_path = "callbacks/LRS2/AV/EffConfAdaptiveCTC_LM"
 
-# Model
 model = nnet.AudioVisualEfficientConformerInterCTC(
     vocab_size=vocab_size,
     v_interctc_blocks=v_interctc_blocks,
     a_interctc_blocks=a_interctc_blocks,
     f_interctc_blocks=f_interctc_blocks,
 )
+
+# Enable adaptive decoding with n-gram + neural LM on high-entropy tier
+adaptive_decoder = nnet.AdaptiveCTCDecoder(
+    tokenizer_path=tokenizer_path,
+    entropy_low=1.2,
+    entropy_high=2.0,
+    small_beam=8,
+    large_beam=32,
+    exclude_blank=True,
+    # Use 6-gram ARPA and neural LM rescoring for the large-beam path
+    ngram_path="datasets/LRS3/6gram_lrs23.arpa",
+    ngram_tmp=1.0,
+    ngram_alpha=0.6,
+    ngram_beta=1.0,
+    ngram_offset=100,
+    num_processes=4,
+    neural_config_path="configs/LRS23/LM/GPT-Small_Infer.py",
+    neural_checkpoint="checkpoints_epoch_10_step_2860.ckpt",
+    neural_alpha=0.6,
+    neural_beta=1.0,
+)
+
 model.compile(
     losses={
+        # Compute loss only on final outputs head to avoid mismatched target mapping
         "outputs": nnet.CTCLoss(zero_infinity=True, assert_shorter=False)
     },
     decoders={
-        "outputs": (
-            nnet.CTCGreedySearchDecoder(tokenizer_path=tokenizer_path)
-            if not beamsearch
-            else nnet.CTCBeamSearchDecoder(
-                tokenizer_path=tokenizer_path,
-                beam_size=beam_size,
-                ngram_path=None,
-            )
-        )
+        "outputs": adaptive_decoder
     },
-    metrics={"outputs": nnet.WordErrorRate()},
+    metrics={"outputs": [nnet.WordErrorRate(), nnet.CharacterErrorRate()]},
     loss_weights=loss_weights,
 )
 
-# Optionally load LRW front-end
-if lrw_pretrained:
-    lrw_checkpoint = torch.load(lrw_checkpoint, map_location=model.device)
-    for key, value in lrw_checkpoint["model_state_dict"].copy().items():
-        if not "front_end" in key:
-            lrw_checkpoint["model_state_dict"].pop(key)
-    model.encoder.video_encoder.front_end.load_state_dict(
-        {key.replace(".module.", ".").replace("encoder.front_end.", ""): value for key, value in lrw_checkpoint["model_state_dict"].items()}
-    )
-
-# Datasets (LRS2 only)
 align = False
 video_max_length = 150
 collate_fn = nnet.CollateFn(
@@ -103,7 +87,6 @@ training_video_transform = nn.Sequential(
 )
 evaluation_video_transform = torchvision.transforms.CenterCrop(crop_size)
 
-# Use only LRS2; if you prepared a subset, the dataset class can respect it
 training_dataset = nnet.datasets.LRS(
     batch_size=batch_size,
     collate_fn=collate_fn,
@@ -112,7 +95,7 @@ training_dataset = nnet.datasets.LRS(
     video_max_length=video_max_length,
     video_transform=training_video_transform,
     align=align,
-    subset_fraction=0.3
+    subset_fraction=0.3,
 )
 
 evaluation_dataset = [
@@ -123,6 +106,6 @@ evaluation_dataset = [
         mode="test",
         video_transform=evaluation_video_transform,
         align=align,
-        subset_fraction=1.0
+        subset_fraction=1.0,
     )
 ]

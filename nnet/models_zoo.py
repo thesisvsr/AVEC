@@ -46,12 +46,18 @@ class VisualEfficientConformerCE(Model):
         loss_weights=None,
         optimizer="Adam",
         metrics=metrics.CategoricalAccuracy(),
-        decoders=None
+        decoders=None,
+        grad_max_norm: float | None = 1.0,
+        ema_tau: float | None = None
     ):
 
         if optimizer == "Adam":
             lr = schedulers.NoamDecayScheduler(warmup_steps=10000, dim_decay=360, val_factor=2)
             optimizer = optimizers.Adam(params=self.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=1e-6)
+        elif optimizer == "AdamW":
+            # Cosine schedule with modest warmup for stability on CE classifier
+            lr = schedulers.CosineAnnealingScheduler(warmup_steps=1000, val_max=3e-4, val_min=3e-5, end_step=200000)
+            optimizer = optimizers.AdamW(params=optimizers.get_decay_param_groups(self, weight_decay=0.05), lr=lr, betas=(0.9, 0.98), eps=1e-8)
 
         super(VisualEfficientConformerCE, self).compile(
             losses=losses,
@@ -60,6 +66,13 @@ class VisualEfficientConformerCE(Model):
             metrics=metrics,
             decoders=decoders
         )
+        # Apply stabilizers
+        self.grad_max_norm = grad_max_norm
+        if ema_tau is not None and ema_tau > 0:
+            try:
+                self.set_ema(ema_tau)
+            except Exception:
+                pass
             
 class AudioEfficientConformerInterCTC(Model):
 

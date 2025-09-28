@@ -79,7 +79,13 @@ class Module(nn.Module):
         elif isinstance(struct, tuple):
             return tuple([self.transfer_to_device(value, device=device) for value in struct])
         elif isinstance(struct, torch.Tensor) or isinstance(struct, nn.Module):
-            return struct.to(device if device != None else self.device)
+            # Use non_blocking transfers when possible (DataLoader pin_memory=True)
+            dev = device if device is not None else self.device
+            try:
+                return struct.to(dev, non_blocking=("cuda" in str(dev)))
+            except TypeError:
+                # Fallback for older PyTorch versions without non_blocking on .to for modules
+                return struct.to(dev)
         elif struct is None:
             return struct
         else:
