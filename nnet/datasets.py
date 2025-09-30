@@ -758,6 +758,292 @@ class LRW(Dataset):
 
         return video, audio, label
 
+class LRWAR(Dataset):
+
+    """Lip Reading in the Wild for Arabic (LRW-AR) word-level dataset.
+
+    Dataset origin: https://crns-smartvision.github.io/lrwar
+
+    Folder structure inside ``datasets/LRW-AR`` matches the official release::
+
+        sorted_labels.txt                 # ordered vocabulary (100 words)
+        train/
+            WORD_1/
+                <clip_id>_WORD_1.mp4
+                <clip_id>_WORD_1.csv     # optional metadata with word timings
+            WORD_2/
+                ...
+        val/
+            ...
+        test/
+            ...
+
+    Each clip lasts ~1.2 s at 25 fps and is already cropped around the face.
+    We keep the interface close to :class:`LRW` so that classification configs
+    can be re-used with minimal changes. By default the dataset returns a tuple
+    ``(video, audio, label)`` where:
+
+    * ``video`` is a float tensor with shape ``(C, T, H, W)``
+    * ``audio`` is ``None`` unless ``load_audio=True``
+    * ``label`` is the integer class index corresponding to the spoken word
+
+    Additional options allow enforcing a fixed temporal length, restricting the
+    subset size for quick experiments, and optionally loading the short
+    transcript sequence extracted from the accompanying CSV metadata.
+    """
+
+    def __init__(
+        self,
+        batch_size,
+        collate_fn,
+        root="datasets",
+        shuffle=True,
+        mode="train",
+        img_mean=(0.5,),
+        img_std=(0.5,),
+        center_crop_size=(96, 96),
+        load_audio=False,
+        load_video=True,
+        video_transform=None,
+        audio_transform=None,
+        fixed_frames=None,
+        subset_fraction=1.0,
+        subset_seed=0,
+        return_transcript=False,
+        indices_path=None,
+        prepared_only=False,
+        use_arabish=False,
+    ):
+        super(LRWAR, self).__init__(batch_size=batch_size, collate_fn=collate_fn, root=root, shuffle=shuffle)
+
+        assert mode in ["train", "val", "test"], "mode must be one of train/val/test"
+        self.mode = mode
+        self.center_crop_size = center_crop_size
+        self.load_audio = load_audio
+        self.load_video = load_video
+        self.fixed_frames = fixed_frames
+        self.return_transcript = return_transcript
+        self.subset_fraction = float(subset_fraction) if subset_fraction is not None else 1.0
+        self.subset_seed = int(subset_seed) if subset_seed is not None else 0
+        self.indices_path = indices_path
+        self.prepared_only = prepared_only
+        self.use_arabish = use_arabish
+        self._arabish_fn = None
+        if self.use_arabish:
+            try:
+                from scripts.arabish_lookup import to_arabish  # type: ignore
+                self._arabish_fn = to_arabish
+            except Exception:
+                self._arabish_fn = None
+
+        dataset_root = os.path.join(self.root, "LRW-AR")
+        if not os.path.isdir(dataset_root):
+            raise FileNotFoundError(f"LRW-AR dataset root not found at {dataset_root}")
+
+        labels_path = os.path.join(dataset_root, "sorted_labels.txt")
+        if os.path.isfile(labels_path):
+            with open(labels_path, "r", encoding="utf-8") as f:
+                words = [line.strip() for line in f.readlines() if line.strip()]
+        else:
+            words = []
+
+        # Two modes of initialization:
+        #  (A) indices file provided (prepared style like LipBengal)
+        #  (B) raw scan of mp4 hierarchy
+        if self.indices_path and os.path.isfile(self.indices_path):
+            try:
+                items = torch.load(self.indices_path, map_location="cpu")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load LRW-AR indices from {self.indices_path}: {e}")
+            # Build vocabulary from items if not from labels file
+            if not words:
+                vocab_set = set()
+                for it in items:
+                    w = it.get("word")
+                    if isinstance(w, str) and w:
+                        vocab_set.add(w)
+                words = sorted(vocab_set)
+            self.classes = words
+            self.class_to_index = {w: i for i, w in enumerate(self.classes)}
+            self.num_classes = len(self.classes)
+
+            if self.prepared_only:
+                filtered = []
+                miss = 0
+                for it in items:
+                    p = it.get("prepared")
+                    if p and os.path.isfile(p):
+                        filtered.append(it)
+                    else:
+                        miss += 1
+                items = filtered
+                if miss:
+                    try:
+                        print(f"LRW-AR[{self.mode}] prepared_only=True: kept {len(items)} missing {miss}")
+                    except Exception:
+                        pass
+            self.items = items
+        else:
+            if not words:
+                # derive from directory names of chosen split if labels file missing
+                words = sorted({os.path.basename(d) for d in glob.glob(os.path.join(dataset_root, mode, "*")) if os.path.isdir(d)})
+            if len(words) == 0:
+                raise RuntimeError("Could not determine LRW-AR vocabulary; check dataset installation")
+            self.classes = words
+            self.class_to_index = {w: i for i, w in enumerate(self.classes)}
+            self.num_classes = len(self.classes)
+
+            pattern = os.path.join(dataset_root, mode, "*", "*.mp4")
+            samples = []
+            for mp4_path in sorted(glob.glob(pattern)):
+                word = os.path.basename(os.path.dirname(mp4_path))
+                if word not in self.class_to_index:
+                    continue
+                csv_path = mp4_path[:-4] + ".csv"
+                transcript = None
+                if return_transcript and os.path.isfile(csv_path):
+                    transcript = self._load_transcript(csv_path)
+                samples.append({
+                    "video_path": mp4_path,
+                    "csv_path": csv_path if os.path.isfile(csv_path) else None,
+                    "word": word,
+                    "transcript": transcript,
+                })
+            if len(samples) == 0:
+                raise RuntimeError(f"No LRW-AR samples found for split '{mode}'. Checked pattern: {pattern}")
+            if self.subset_fraction is not None and self.subset_fraction < 1.0:
+                total = len(samples)
+                keep = max(1, int(round(total * self.subset_fraction)))
+                if keep < total:
+                    rng = np.random.RandomState(self.subset_seed)
+                    idx = rng.permutation(total)[:keep]
+                    idx.sort()
+                    samples = [samples[i] for i in idx]
+                    try:
+                        print(f"LRW-AR[{mode}] subset: {keep}/{total} (~{self.subset_fraction*100:.1f}%)")
+                    except Exception:
+                        pass
+            self.samples = samples
+
+        # Optional Arabish transliteration applied AFTER loading (does not change prepared paths)
+        if self.use_arabish and self._arabish_fn is not None:
+            # Build mapping preserving original order as encountered in current class list
+            trans_map = {}
+            new_classes = []
+            for w in self.classes:
+                w2 = self._arabish_fn(w)
+                if w2 not in trans_map.values():  # allow duplicates collapse
+                    new_classes.append(w2)
+                trans_map[w] = w2
+            self.original_classes = self.classes
+            self.classes = new_classes
+            self.class_to_index = {w: i for i, w in enumerate(self.classes)}
+            self.num_classes = len(self.classes)
+            # Rewrite word fields in items/samples
+            def _apply(lst):
+                for it in lst:
+                    ow = it.get("word")
+                    if not isinstance(ow, str):
+                        continue
+                    aw = trans_map.get(ow, ow)
+                    it["word_orig"] = ow
+                    it["word"] = aw
+            if hasattr(self, "items"):
+                _apply(self.items)
+            else:
+                _apply(self.samples)
+
+        preprocess = [
+            torchvision.transforms.ConvertImageDtype(dtype=torch.float32),
+            layers.Permute(dims=(1, 0, 2, 3)),
+            torchvision.transforms.Grayscale(),
+            layers.Permute(dims=(1, 0, 2, 3)),
+        ]
+        if isinstance(center_crop_size, (int, tuple)) and center_crop_size is not None:
+            preprocess.append(transforms.CenterCropVideo(center_crop_size))
+        preprocess.extend([
+            transforms.NormalizeVideo(mean=img_mean, std=img_std),
+            video_transform if video_transform is not None else nn.Identity(),
+        ])
+        self.video_preprocessing = torchvision.transforms.Compose(preprocess)
+        self.audio_preprocessing = audio_transform if audio_transform is not None else nn.Identity()
+
+    def _load_transcript(self, csv_path):
+        words = []
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                header = next(f, None)
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 4:
+                        token = parts[3].strip()
+                        if token:
+                            words.append(token)
+        except Exception:
+            return None
+        return " ".join(words) if words else None
+
+    def __len__(self):
+        if hasattr(self, "items"):
+            return len(self.items)
+        return len(self.samples)
+
+    def _ensure_fixed_frames(self, video: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.fixed_frames, int) and self.fixed_frames > 0:
+            C, T, H, W = video.shape
+            if T > self.fixed_frames:
+                idx = torch.linspace(0, T - 1, steps=self.fixed_frames).round().long()
+                video = video.index_select(1, idx)
+            elif T < self.fixed_frames:
+                pad = video[:, -1:, :, :].expand(C, self.fixed_frames - T, H, W).clone()
+                video = torch.cat([video, pad], dim=1)
+        return video
+
+    def __getitem__(self, n):
+        # Prepared/indices path mode
+        if hasattr(self, "items"):
+            entry = self.items[n]
+            word = entry["word"]
+            label = torch.tensor(self.class_to_index[word], dtype=torch.long)
+            prepared_path = entry.get("prepared")
+            if prepared_path and os.path.isfile(prepared_path):
+                obj = torch.load(prepared_path, map_location="cpu")
+                if isinstance(obj, dict) and "frames" in obj:
+                    x = obj["frames"]  # (T, H, W)
+                    if isinstance(x, np.ndarray):
+                        x = torch.from_numpy(x)
+                    video = x.unsqueeze(0).permute(0, 1, 2, 3).to(torch.float32) / 255.0
+                else:
+                    raise RuntimeError(f"Unsupported prepared format at {prepared_path}")
+                if isinstance(self.fixed_frames, int) and self.fixed_frames > 0:
+                    C, T, H, W = video.shape
+                    if T > self.fixed_frames:
+                        idx = torch.linspace(0, T - 1, steps=self.fixed_frames).round().long()
+                        video = video.index_select(1, idx)
+                    elif T < self.fixed_frames:
+                        pad = video[:, -1:, :, :].expand(C, self.fixed_frames - T, H, W).clone()
+                        video = torch.cat([video, pad], dim=1)
+                video = self.video_preprocessing(video)
+                return video, None, label
+            # Fallback to raw video if prepared missing
+        sample = self.samples[n]
+        word = sample["word"]
+        label = torch.tensor(self.class_to_index[word], dtype=torch.long)
+        if self.load_video or self.load_audio:
+            raw_video, raw_audio, info = torchvision.io.read_video(sample["video_path"], pts_unit="sec")
+        else:
+            raw_video = raw_audio = None
+        video = None
+        audio = None
+        if self.load_video:
+            video = raw_video.permute(3, 0, 1, 2)
+            video = self.video_preprocessing(video)
+            video = self._ensure_fixed_frames(video)
+        if self.load_audio and raw_audio is not None and hasattr(raw_audio, 'numel') and raw_audio.numel() > 0:
+            audio = raw_audio.t().contiguous()
+            audio = self.audio_preprocessing(audio)
+        return video, audio, label
+
     class PrepareDataset:
 
         def __init__(self, paths, mean_face_path):
@@ -819,6 +1105,199 @@ class LRW(Dataset):
         )
         for batch in tqdm(dataloader):
             pass
+
+class LRWB(Dataset):
+
+    """LRW-B Bengali word-level dataset (prepared indices + mouth crops).
+
+    Directory layout expected (produced by scripts/preprocess_lrw_b.py)::
+
+        datasets/LRW-B/
+            sorted_labels.txt               # Bangla words (train vocab)
+            indices/{train,val,test}.pt     # list[dict]: {word, prepared, T}
+            prepared/{split}/{WORD}/*.pt    # per-clip tensors {frames:uint8[T,H,W], meta: {method, word}}
+
+    This loader mirrors LRWAR prepared-indices path but adds optional Bangla ->
+    Banglish transliteration (ASCII) via scripts/banglish_lookup.py when
+    use_banglish=True. Transliteration is applied AFTER loading the indices
+    so the underlying prepared file paths remain valid.
+    """
+
+    def __init__(
+        self,
+        batch_size,
+        collate_fn,
+        root="datasets",
+        shuffle=True,
+        mode="train",
+        img_mean=(0.5,),
+        img_std=(0.5,),
+        center_crop_size=(96, 96),
+        video_transform=None,
+        fixed_frames=30,
+        indices_path=None,
+        prepared_only=True,
+        subset_fraction=1.0,
+        subset_seed=0,
+        use_banglish=False,
+    ):
+        super(LRWB, self).__init__(batch_size=batch_size, collate_fn=collate_fn, root=root, shuffle=shuffle)
+        assert mode in ["train", "val", "test"], "mode must be one of train/val/test"
+        self.mode = mode
+        self.center_crop_size = center_crop_size
+        self.fixed_frames = fixed_frames
+        self.indices_path = indices_path or os.path.join(self.root, "LRW-B", "indices", f"{mode}.pt")
+        self.prepared_only = prepared_only
+        self.subset_fraction = float(subset_fraction)
+        self.subset_seed = int(subset_seed)
+        self.use_banglish = use_banglish
+        self._banglish_fn = None
+        if self.use_banglish:
+            try:
+                from scripts.banglish_lookup import to_banglish  # type: ignore
+                self._banglish_fn = to_banglish
+            except Exception:
+                self._banglish_fn = None
+
+        ds_root = os.path.join(self.root, "LRW-B")
+        if not os.path.isdir(ds_root):
+            raise FileNotFoundError(f"LRW-B dataset root not found at {ds_root}")
+
+        labels_path = os.path.join(ds_root, "sorted_labels.txt")
+        words = []
+        if os.path.isfile(labels_path):
+            with open(labels_path, "r", encoding="utf-8") as f:
+                words = [ln.strip() for ln in f if ln.strip()]
+
+        if not (self.indices_path and os.path.isfile(self.indices_path)):
+            raise FileNotFoundError(f"LRW-B indices file missing: {self.indices_path}")
+        try:
+            items = torch.load(self.indices_path, map_location="cpu")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load LRW-B indices: {e}")
+        # Build / reconcile vocabulary
+        if not words:
+            # No labels file: derive entirely from indices
+            vocab_set = {it.get("word") for it in items if isinstance(it.get("word"), str)}
+            words = sorted(vocab_set)
+        else:
+            # Ensure every indexed word appears; append any missing (stable extension)
+            existing = set(words)
+            missing_words = sorted({it.get("word") for it in items if isinstance(it.get("word"), str)} - existing)
+            if missing_words:
+                words.extend(missing_words)
+                # Persist updated vocabulary so val/test datasets share identical ordering
+                try:
+                    with open(labels_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(words))
+                    print(f"LRW-B: extended vocabulary with {len(missing_words)} new words; now {len(words)} total. Updated sorted_labels.txt")
+                except Exception:
+                    print(f"LRW-B: extended vocabulary in-memory with {len(missing_words)} new words (failed to rewrite file)")
+        self.classes = words
+        self.class_to_index = {w: i for i, w in enumerate(self.classes)}
+        self.num_classes = len(self.classes)
+
+        if self.prepared_only:
+            filtered = []
+            miss = 0
+            for it in items:
+                p = it.get("prepared")
+                if p and os.path.isfile(p):
+                    filtered.append(it)
+                else:
+                    miss += 1
+            items = filtered
+            if miss:
+                try:
+                    print(f"LRW-B[{self.mode}] prepared_only=True: kept {len(items)} missing {miss}")
+                except Exception:
+                    pass
+
+        # Optional Banglish transliteration (ensure unique labels)
+        if self.use_banglish and self._banglish_fn is not None:
+            trans_map = {}
+            new_classes = []
+            counts = {}
+            for w in self.classes:
+                bw = self._banglish_fn(w)
+                # Enforce uniqueness by suffixing if needed
+                if bw in counts:
+                    counts[bw] += 1
+                    bw_unique = f"{bw}_{counts[bw]}"
+                else:
+                    counts[bw] = 1
+                    bw_unique = bw
+                trans_map[w] = bw_unique
+                new_classes.append(bw_unique)
+            self.original_classes = self.classes
+            self.classes = new_classes
+            self.class_to_index = {w: i for i, w in enumerate(self.classes)}
+            self.num_classes = len(self.classes)
+            for it in items:
+                ow = it.get("word")
+                if isinstance(ow, str):
+                    it["word_orig"] = ow
+                    it["word"] = trans_map.get(ow, ow)
+
+        # Optional subset
+        if self.subset_fraction is not None and self.subset_fraction < 1.0:
+            total = len(items)
+            keep = max(1, int(round(total * self.subset_fraction)))
+            if keep < total:
+                rng = np.random.RandomState(self.subset_seed)
+                idx = rng.permutation(total)[:keep]
+                idx.sort()
+                items = [items[i] for i in idx]
+                try:
+                    print(f"LRW-B[{self.mode}] subset: {keep}/{total} (~{self.subset_fraction*100:.1f}%)")
+                except Exception:
+                    pass
+        self.items = items
+
+        preprocess = [
+            torchvision.transforms.ConvertImageDtype(dtype=torch.float32),
+            layers.Permute(dims=(1, 0, 2, 3)),
+            torchvision.transforms.Grayscale(),
+            layers.Permute(dims=(1, 0, 2, 3)),
+        ]
+        if isinstance(center_crop_size, (int, tuple)) and center_crop_size is not None:
+            preprocess.append(transforms.CenterCropVideo(center_crop_size))
+        preprocess.extend([
+            transforms.NormalizeVideo(mean=img_mean, std=img_std),
+            video_transform if video_transform is not None else nn.Identity(),
+        ])
+        self.video_preprocessing = torchvision.transforms.Compose(preprocess)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, n):
+        entry = self.items[n]
+        word = entry["word"]
+        label = torch.tensor(self.class_to_index[word], dtype=torch.long)
+        prepared_path = entry.get("prepared")
+        if prepared_path and os.path.isfile(prepared_path):
+            obj = torch.load(prepared_path, map_location="cpu")
+            if isinstance(obj, dict) and "frames" in obj:
+                x = obj["frames"]  # (T,H,W)
+                if isinstance(x, np.ndarray):
+                    x = torch.from_numpy(x)
+                video = x.unsqueeze(0)  # (1,T,H,W)
+            else:
+                raise RuntimeError(f"Unsupported prepared format at {prepared_path}")
+        else:
+            raise FileNotFoundError(f"Prepared path missing for LRW-B sample: {prepared_path}")
+        C, T, H, W = video.shape
+        if isinstance(self.fixed_frames, int) and self.fixed_frames > 0:
+            if T > self.fixed_frames:
+                idx = torch.linspace(0, T - 1, steps=self.fixed_frames).round().long()
+                video = video.index_select(1, idx)
+            elif T < self.fixed_frames:
+                pad = video[:, -1:, :, :].expand(C, self.fixed_frames - T, H, W).clone()
+                video = torch.cat([video, pad], dim=1)
+        video = self.video_preprocessing(video)
+        return video, None, label
+
 
 class LipBengal(Dataset):
 

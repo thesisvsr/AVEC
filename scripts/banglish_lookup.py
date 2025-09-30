@@ -1,136 +1,140 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
-from pathlib import Path
-from functools import lru_cache
-from typing import List, Dict
-import unicodedata
+"""Bengali -> Banglish (ASCII transliteration) helper.
 
-BN_PATH = Path("datasets/LipBengal/word_list.txt")
-EN_PATH = Path("datasets/LipBengal/word_list_banglish.txt")
+Lightweight, rule-based transliteration aimed at producing stable, lowercase
+ASCII tokens for word-level classification (filenames / class labels).
 
+Design goals:
+ - Deterministic 1:1 mapping (if collisions occur, the dataset class will
+   disambiguate by suffixing _2, _3, ... so we DO NOT collapse duplicates here).
+ - Keep only [a-z0-9_] characters; strip or approximate everything else.
+ - Very small / dependency-free (no external transliteration libraries).
 
-def _read_nonempty_lines(p: Path) -> List[str]:
-    if not p.exists():
-        raise FileNotFoundError(f"Missing list file: {p}")
-    text = p.read_text(encoding="utf-8")
-    # Keep spaces inside lines; drop empty lines
-    return [ln.rstrip("\n") for ln in text.splitlines() if ln.strip() != ""]
+Simplifications:
+ - Inherent vowel (ô / ɔ) rendered as "o" when a consonant appears without an
+   explicit vowel mark.
+ - Long vs short vowels generally not distinguished beyond a/e/i/o/u (some
+   approximate digraphs retained: ai, oi, oi, ou, au) -> we map ঐ/ৈ -> oi, ঔ/ৌ -> ou.
+ - Anusvara (ং) -> ng; Chandrabindu (ঁ) -> n; Visarga (ঃ) -> h.
 
+If you later want a more linguistically faithful system, you can swap out
+`to_banglish` while keeping prepared data intact (indices store the original
+Bangla word; transliteration applied at load time when `use_banglish=True`).
+"""
 
-@lru_cache(maxsize=1)
-def _mapping() -> Dict[str, str]:
-    bn = _read_nonempty_lines(BN_PATH)
-    en = _read_nonempty_lines(EN_PATH)
-    if len(bn) != len(en):
-        raise ValueError(
-            f"List length mismatch: {len(bn)} Bengali vs {len(en)} Banglish. "
-            "Ensure both files are generated from the same source and aligned by index."
-        )
-    # Build both exact and normalized maps
-    m: Dict[str, str] = {}
-    for b, e in zip(bn, en):
-        m[b] = e
-        nb = _normalize_bn(b)
-        if nb not in m:
-            m[nb] = e
-        nb_nospace = nb.replace(" ", "")
-        if nb_nospace not in m:
-            m[nb_nospace] = e
-    return m
+import re
 
+# Independent vowels
+_VOWELS = {
+    "অ": "o",  # inherent /ɔ/
+    "আ": "a",
+    "ই": "i",
+    "ঈ": "i",
+    "উ": "u",
+    "ঊ": "u",
+    "ঋ": "ri",
+    "এ": "e",
+    "ঐ": "oi",
+    "ও": "o",
+    "ঔ": "ou",
+}
 
-def _normalize_bn(s: str) -> str:
-    # Normalize Unicode form and whitespace; strip zero-width joiners
-    if not isinstance(s, str):
-        return s
-    s = s.replace("\u00A0", " ")  # NBSP -> space
-    s = s.replace("\u200c", "").replace("\u200d", "")  # ZWNJ/ZWJ
-    s = unicodedata.normalize("NFC", s)
-    s = " ".join(s.split())  # collapse whitespace
-    return s
+# Vowel signs (diacritics) combining with a consonant base
+_VOWEL_SIGNS = {
+    "া": "a",
+    "ি": "i",
+    "ী": "i",
+    "ু": "u",
+    "ূ": "u",
+    "ৃ": "ri",
+    "ে": "e",
+    "ৈ": "oi",
+    "ো": "o",
+    "ৌ": "ou",
+}
 
+# Consonants
+_CONS = {
+    "ক": "k",  "খ": "kh", "গ": "g",  "ঘ": "gh", "ঙ": "ng",
+    "চ": "c",  "ছ": "ch", "জ": "j",  "ঝ": "jh", "ঞ": "ny",
+    "ট": "t",  "ঠ": "th", "ড": "d",  "ঢ": "dh", "ণ": "n",
+    "ত": "t",  "থ": "th", "দ": "d",  "ধ": "dh", "ন": "n",
+    "প": "p",  "ফ": "ph", "ব": "b",  "ভ": "bh", "ম": "m",
+    "য": "y",  "র": "r",  "ল": "l",  "শ": "sh", "ষ": "sh", "স": "s", "হ": "h",
+    "ড়": "r",  "ঢ়": "rh", "য়": "y",
+}
 
-def _transliterate_fallback(w: str) -> str:
-    """Lightweight Bangla->Banglish transliteration for unknown words."""
-    INDEP_VOWELS = {
-        "অ": "o", "আ": "a", "ই": "i", "ঈ": "ii", "উ": "u", "ঊ": "uu",
-        "ঋ": "ri", "ৠ": "ri", "ঌ": "li", "ৡ": "li",
-        "এ": "e", "ঐ": "oi", "ও": "o", "ঔ": "ou",
-    }
-    VOWEL_SIGNS = {
-        "া": "a", "ি": "i", "ী": "ii", "ু": "u", "ূ": "uu",
-        "ৃ": "ri", "ে": "e", "ৈ": "oi", "ো": "o", "ৌ": "ou",
-    }
-    CONSONANTS = {
-        "ক": "k", "খ": "kh", "গ": "g", "ঘ": "gh", "ঙ": "ng",
-        "চ": "ch", "ছ": "chh", "জ": "j", "ঝ": "jh", "ঞ": "ny",
-        "ট": "t", "ঠ": "th", "ড": "d", "ঢ": "dh", "ণ": "n",
-        "ত": "t", "থ": "th", "দ": "d", "ধ": "dh", "ন": "n",
-        "প": "p", "ফ": "f", "ব": "b", "ভ": "bh", "ম": "m",
-        "য": "j", "র": "r", "ল": "l", "শ": "sh", "ষ": "sh", "স": "s", "হ": "h",
-        "ড়": "r", "ঢ়": "rh", "য়": "y", "য়": "y", "ৎ": "t",
-    }
-    VIRAMA = "্"
-    NASAL = {"ং": "ng", "ঁ": "n"}
-    VISARGA = {"ঃ": "h"}
+# Specials / signs
+_SPECIAL = {
+    "ং": "ng",  # anusvara
+    "ঃ": "h",   # visarga
+    "ঁ": "n",   # chandrabindu
+    "্": "",    # virama (halant) -> suppress inherent vowel
+}
 
-    def _token(token: str) -> str:
-        s = token
-        out = []
-        i = 0
-        n = len(s)
-        while i < n:
-            c = s[i]
-            if c in INDEP_VOWELS:
-                out.append(INDEP_VOWELS[c]); i += 1; continue
-            if c in CONSONANTS:
-                base = CONSONANTS[c]
-                if i + 1 < n and s[i + 1] in VOWEL_SIGNS:
-                    out.append(base + VOWEL_SIGNS[s[i + 1]]); i += 2; continue
-                if i + 1 < n and s[i + 1] == VIRAMA:
-                    out.append(base); i += 2; continue
-                if i < n - 1:
-                    out.append(base + "o")
-                else:
-                    out.append(base)
-                i += 1; continue
-            if c in VOWEL_SIGNS:
-                out.append(VOWEL_SIGNS[c]); i += 1; continue
-            if c in NASAL:
-                out.append(NASAL[c]); i += 1; continue
-            if c in VISARGA:
-                out.append(VISARGA[c]); i += 1; continue
-            out.append(c); i += 1
-        return "".join(out).lower()
+# Accepted final pattern (filter everything else to underscore)
+_SAFE_RE = re.compile(r"[^a-z0-9]+")
 
-    return " ".join(_token(t) for t in w.split(" "))
+def _tokenize(chars: str):  # minimal segmentation (character-wise)
+    for ch in chars:
+        yield ch
 
+def to_banglish(word: str, collapse_double=True) -> str:
+    w = word.strip()
+    if not w:
+        return w
+    out: list[str] = []
+    prev_was_cons = False
+    have_explicit_vowel = False
+    for ch in _tokenize(w):
+        if ch in _VOWELS:
+            # Independent vowel overrides pending inherent vowel
+            out.append(_VOWELS[ch])
+            prev_was_cons = False
+            have_explicit_vowel = True
+        elif ch in _CONS:
+            # If previous consonant without explicit vowel, append inherent vowel 'o'
+            if prev_was_cons and not have_explicit_vowel:
+                out.append("o")
+            out.append(_CONS[ch])
+            prev_was_cons = True
+            have_explicit_vowel = False
+        elif ch in _VOWEL_SIGNS:
+            # Attach vowel sign to previous consonant (replace inherent)
+            out.append(_VOWEL_SIGNS[ch])
+            prev_was_cons = False
+            have_explicit_vowel = True
+        elif ch in _SPECIAL:
+            # If virama, just suppress inherent vowel by marking state
+            if ch == "্":
+                prev_was_cons = False  # next consonant treated anew
+                have_explicit_vowel = True  # suppress adding 'o'
+            else:
+                out.append(_SPECIAL[ch])
+                prev_was_cons = False
+                have_explicit_vowel = True
+        else:
+            # Unknown char: treat as separator
+            if prev_was_cons and not have_explicit_vowel:
+                out.append("o")
+            prev_was_cons = False
+            have_explicit_vowel = True
+    # Flush trailing inherent vowel
+    if prev_was_cons and not have_explicit_vowel:
+        out.append("o")
+    token = "".join(out)
+    if collapse_double:
+        # Collapse >2 repeats then allow limited doubles for readability
+        token = re.sub(r"([a-z])\1{2,}", r"\1\1", token)
+    token = _SAFE_RE.sub("_", token)
+    token = token.strip("_")
+    if not token:
+        token = "unk"
+    return token
 
-def to_banglish(word: str) -> str:
-    """
-    Given a Bengali word exactly as it appears in datasets/LipBengal/word_list.txt,
-    return the corresponding Banglish string from datasets/LipBengal/word_list_banglish.txt.
-    """
-    m = _mapping()
-    # Try exact then normalized keys and no-space variant
-    keys = [word]
-    nword = _normalize_bn(word)
-    if nword != word:
-        keys.append(nword)
-    nword_ns = nword.replace(" ", "")
-    if nword_ns not in keys:
-        keys.append(nword_ns)
-    for k in keys:
-        if k in m:
-            return m[k]
-    # Fallback: approximate transliteration
-    return _transliterate_fallback(nword)
-
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python3 scripts/banglish_lookup.py <bengali word> [more words...]")
-        raise SystemExit(2)
-    for w in sys.argv[1:]:
-        print(to_banglish(w))
+if __name__ == "__main__":  # simple smoke test
+    tests = ["বাংলা", "অংশগ্রহণ", "অবস্থা", "অনুমান", "অধিকার", "অবশ্যই", "অঙ্কন", "অংশ"]
+    for t in tests:
+        print(f"{t} -> {to_banglish(t)}")
