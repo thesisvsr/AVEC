@@ -1651,3 +1651,123 @@ class LipBengal(Dataset):
 
         # Return as (video, None, label) to mirror LRW triple layout
         return video, None, label
+
+
+class BSRDCTC(Dataset):
+    """BSRD sentence-level visual dataset for CTC training (visual-only for now).
+
+    Expects indices produced by scripts/prepare_bsrd.py:
+        datasets/BSRD/indices/{train,val,test}.pt -> list[dict]
+          each dict may contain:
+            speaker, id, video_path, rom_text, bn_text, prepared (optional), T
+
+    Returns batches compatible with CTC training similar to LRS2 style but only video & label.
+    __getitem__ returns: (video, None, label_tensor, video_len, None, label_len)
+    (Audio placeholders kept as None to reuse generic collate paths if present.)
+    """
+    def __init__(self, batch_size, collate_fn, root="datasets", shuffle=True, mode="train", indices_path=None, vocab_path="datasets/BSRD/vocab/char2idx.json", fixed_frames=None, num_frames=None, prepared_only=True, img_mean=(0.5,), img_std=(0.5,), video_transform=None):
+        super(BSRDCTC, self).__init__(batch_size=batch_size, collate_fn=collate_fn, root=root, shuffle=shuffle)
+        assert mode in ("train","val","test"), "mode must be train/val/test"
+        self.mode = mode
+        self.indices_path = indices_path or os.path.join(root, "BSRD", "indices", f"{mode}.pt")
+        self.fixed_frames = fixed_frames
+        self.num_frames = num_frames
+        self.prepared_only = prepared_only
+        try:
+            self.items = torch.load(self.indices_path, map_location="cpu")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load BSRD indices {self.indices_path}: {e}")
+        # Filter prepared if required
+        if self.prepared_only:
+            filt = []
+            miss = 0
+            for it in self.items:
+                p = it.get("prepared")
+                if p and os.path.isfile(p):
+                    filt.append(it)
+                else:
+                    miss += 1
+            self.items = filt
+            if miss:
+                try:
+                    print(f"BSRDCTC[{self.mode}] prepared_only=True: kept {len(filt)}/{{len(filt)+miss}} (missing {miss})")
+                except Exception:
+                    pass
+        # Load char vocab mapping
+        self.char2idx = None
+        if vocab_path and os.path.isfile(vocab_path):
+            import json
+            with open(vocab_path, 'r', encoding='utf-8') as f:
+                self.char2idx = json.load(f)
+        else:
+            print(f"Warning: vocab file not found at {vocab_path}; labels will be empty tensors.")
+        # Preprocessing pipeline (grayscale + normalize)
+        self.video_preprocessing = torchvision.transforms.Compose([
+            torchvision.transforms.ConvertImageDtype(dtype=torch.float32),
+            layers.Permute(dims=(1,0,2,3)),
+            torchvision.transforms.Grayscale(),
+            layers.Permute(dims=(1,0,2,3)),
+            transforms.NormalizeVideo(mean=img_mean, std=img_std),
+            video_transform if video_transform is not None else nn.Identity(),
+        ])
+
+    def __len__(self):
+        return len(self.items)
+
+    def _load_prepared(self, path: str):
+        obj = torch.load(path, map_location="cpu")
+        if isinstance(obj, dict) and 'frames' in obj:
+            x = obj['frames']  # (T,H,W) uint8 or tensor
+            if isinstance(x, np.ndarray):
+                x = torch.from_numpy(x)
+            video = x.unsqueeze(0).to(torch.float32) / 255.0  # (1,T,H,W)
+        else:
+            raise RuntimeError(f"Unsupported prepared tensor format: {path}")
+        return video
+
+    def _decode_frames_fallback(self, video_path: str):
+        # Only used if prepared missing and prepared_only False
+        try:
+            frames, _, _ = torchvision.io.read_video(video_path, pts_unit='sec')
+        except Exception:
+            return torch.zeros(1,1,88,88)
+        # Convert frames to (T,C,H,W) -> grayscale -> (C,T,H,W)
+        if frames.ndim == 4:  # (T,H,W,C)
+            frames = frames.permute(0,3,1,2)  # (T,C,H,W)
+        if self.num_frames and frames.shape[0] > self.num_frames:
+            frames = frames[:self.num_frames]
+        video = frames.permute(1,0,2,3)  # (C,T,H,W)
+        return video
+
+    def _tokenize(self, text: str):
+        if not self.char2idx or not text:
+            return torch.zeros(0, dtype=torch.long)
+        ids = [self.char2idx.get(ch, None) for ch in text]
+        return torch.tensor([i for i in ids if i is not None], dtype=torch.long)
+
+    def __getitem__(self, idx):
+        entry = self.items[idx]
+        prepared_path = entry.get('prepared')
+        if prepared_path and os.path.isfile(prepared_path):
+            video = self._load_prepared(prepared_path)
+        else:
+            video = self._decode_frames_fallback(entry.get('video_path',''))
+        # Enforce fixed frames if requested
+        if isinstance(self.fixed_frames, int) and self.fixed_frames > 0:
+            C, T, H, W = video.shape
+            if T > self.fixed_frames:
+                sel = torch.linspace(0, T-1, steps=self.fixed_frames).round().long()
+                video = video.index_select(1, sel)
+            elif T < self.fixed_frames and T>0:
+                pad = video[:, -1:, :, :].expand(C, self.fixed_frames - T, H, W).clone()
+                video = torch.cat([video, pad], dim=1)
+        video = self.video_preprocessing(video)
+        text = entry.get('rom_text','')
+        label = self._tokenize(text)
+        video_len = torch.tensor(video.shape[1], dtype=torch.long)
+        label_len = torch.tensor(label.shape[0], dtype=torch.long)
+        # Keep return signature similar to LRS: (video, audio, label, video_len, audio_len, label_len)
+        audio = None
+        audio_len = torch.tensor(0, dtype=torch.long)
+        return video, audio, label, video_len, audio_len, label_len
+

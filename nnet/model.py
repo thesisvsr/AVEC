@@ -57,6 +57,19 @@ class Model(Module):
         self.grad_max_norm = None
         # Optional debug: print a few decoded predictions vs targets after eval
         self.preview_samples_per_epoch = 5
+        # Progress bar control (env-driven). Keep inside __init__.
+        import os as _os
+        self.use_tqdm_only = bool(int(_os.environ.get("PROGRESS_TQDM_ONLY", "0")))  # if 1, suppress custom prints that can hide tqdm
+        self.simple_progress = bool(int(_os.environ.get("PROGRESS_SIMPLE", "0")))   # if 1, do not set dynamic descriptions each step
+        self.force_progress_bar = bool(int(_os.environ.get("FORCE_PROGRESS_BAR", "0")))  # if 1, always show a tqdm bar
+        # Inline progress stats inside tqdm bar
+        self.progress_bar_inline = bool(int(_os.environ.get("PROGRESS_BAR_INLINE", "1")))  # if 1, show per-step stats inside bar
+        try:
+            self.progress_bar_interval = max(1, int(_os.environ.get("PROGRESS_BAR_INTERVAL", "1")))  # update postfix every N steps
+        except Exception:
+            self.progress_bar_interval = 1
+        # Comma-separated keys to attempt from losses/infos for postfix (in order)
+        self.progress_bar_keys = [k.strip() for k in _os.environ.get("PROGRESS_POSTFIX_KEYS", "outputs,loss,lr,blank_ratio,grad_scale").split(',') if k.strip()]
 
     def distribute_strategy(self, rank, sync_batch_norm=True):
         if sync_batch_norm:
@@ -764,9 +777,28 @@ class Model(Module):
                     dataset_train.sampler.set_epoch(epoch)
 
                 # Init Iterator
-                if self.rank == 0:
-                    print("Epoch {}/{}:".format(epoch + 1, epochs))
-                    epoch_iterator = tqdm(dataset_train, total=steps_per_epoch * accumulated_steps if steps_per_epoch else None, dynamic_ncols=True)
+                if self.rank == 0 or self.force_progress_bar:
+                    # Use a static epoch header unless in pure tqdm-only mode
+                    if not self.use_tqdm_only and self.rank == 0:
+                        print("Epoch {}/{}:".format(epoch + 1, epochs))
+                    bar_kwargs = dict(
+                        total=steps_per_epoch * accumulated_steps if steps_per_epoch else None,
+                        dynamic_ncols=True,
+                        leave=True,
+                        mininterval=0.2,
+                        smoothing=0.1,
+                        disable=False
+                    )
+                    if self.use_tqdm_only:
+                        # Compact bar format without long description to prevent wrap/hide
+                        bar_kwargs['bar_format'] = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+                    # ASCII fallback if terminal lacks unicode or when forced
+                    if os.environ.get('FORCE_ASCII_BAR','0') == '1':
+                        bar_kwargs['ascii'] = True
+                    # If forcing progress bar from non-rank0, show minimal bar format
+                    if self.force_progress_bar and self.rank != 0:
+                        bar_kwargs['bar_format'] = '{l_bar}{bar}| {n_fmt}/{total_fmt}'
+                    epoch_iterator = tqdm(dataset_train, **bar_kwargs)
                 else:
                     epoch_iterator = dataset_train
 
@@ -808,9 +840,64 @@ class Model(Module):
                     if acc_step > 0:
                         continue
 
-                    # Step Print
-                    if self.rank == 0:
-                        self.display_step(epoch_losses, epoch_metrics, self.infos, epoch_iterator, step + 1)
+                    # Progress / Bar Updates
+                    if self.rank == 0 or self.force_progress_bar:
+                        # Inline postfix update (every progress_bar_interval steps)
+                        if self.progress_bar_inline and hasattr(epoch_iterator, 'set_postfix') and ((step + 1) % self.progress_bar_interval == 0):
+                            postfix_vals = {}
+                            for key in self.progress_bar_keys:
+                                if key in epoch_losses:
+                                    try:
+                                        avg_v = (epoch_losses[key] / (step + 1)).item() if hasattr(epoch_losses[key], 'item') else float(epoch_losses[key] / (step + 1))
+                                        postfix_vals[key] = f"{avg_v:.2f}"
+                                    except Exception:
+                                        pass
+                                elif key in self.infos:
+                                    val = self.infos[key]
+                                    try:
+                                        if hasattr(val, 'item'):
+                                            val = val.item()
+                                        if isinstance(val, (int, float)):
+                                            if 'lr' in key.lower():
+                                                postfix_vals[key] = f"{val:.2e}"
+                                            elif 'ratio' in key.lower() or 'scale' in key.lower() or 'loss' in key.lower():
+                                                postfix_vals[key] = f"{val:.2f}"
+                                            else:
+                                                postfix_vals[key] = f"{val}"
+                                        else:
+                                            postfix_vals[key] = str(val)
+                                    except Exception:
+                                        pass
+                            # Limit width to first 5 keys present
+                            if len(postfix_vals) > 5:
+                                limited = {}
+                                for k in self.progress_bar_keys:
+                                    if k in postfix_vals:
+                                        limited[k] = postfix_vals[k]
+                                        if len(limited) >= 5:
+                                            break
+                                postfix_vals = limited
+                            try:
+                                epoch_iterator.set_postfix(postfix_vals, refresh=False)
+                            except Exception:
+                                pass
+
+                        # Legacy verbose step description (outside bar) when not using pure bar modes
+                        if self.rank == 0 and (not self.simple_progress) and (not self.use_tqdm_only):
+                            self.display_step(epoch_losses, epoch_metrics, self.infos, epoch_iterator, step + 1)
+                        elif self.rank == 0 and self.simple_progress and (step + 1) % step_log_period == 0:
+                            avg_loss = {k: (v / (step + 1)) for k, v in epoch_losses.items()}
+                            lr_val = self.infos.get('lr', None)
+                            msg = f"Step {step+1}"
+                            if 'outputs' in avg_loss:
+                                msg += f" loss={avg_loss['outputs']:.2f}"
+                            if lr_val is not None:
+                                try:
+                                    lr_v = lr_val.item() if hasattr(lr_val,'item') else lr_val
+                                    msg += f" lr={lr_v:.2e}"
+                                except Exception:
+                                    pass
+                            print(msg, flush=True)
 
                     # Logs Step
                     if writer is not None and self.model_step % step_log_period == 0:
@@ -911,6 +998,27 @@ class Model(Module):
 
             if self.rank == 0 and writer is not None:
                 writer.add_text("Exceptions", "Rank: {} \nDate: {} \n{}".format(str(self.rank), time.ctime(), str(e)), self.model_step)
+
+            # Extra diagnostics for CUDA allocation / cuBLAS handle failures
+            err_msg = str(e)
+            if ("CUBLAS_STATUS_ALLOC_FAILED" in err_msg or "cublasCreate" in err_msg or "CUDA out of memory" in err_msg) and torch.cuda.is_available():
+                try:
+                    if self.rank == 0:
+                        print("[CUDA-DIAG] Detected CUDA allocation/handle failure. Collecting memory stats...")
+                        print("[CUDA-DIAG] Device:", torch.cuda.get_device_name(self.device))
+                        print("[CUDA-DIAG] Mem Allocated (MB):", torch.cuda.memory_allocated(self.device)/1024/1024)
+                        print("[CUDA-DIAG] Mem Reserved  (MB):", torch.cuda.memory_reserved(self.device)/1024/1024)
+                        print("[CUDA-DIAG] Max Allocated (MB):", torch.cuda.max_memory_allocated(self.device)/1024/1024)
+                        print("[CUDA-DIAG] Max Reserved  (MB):", torch.cuda.max_memory_reserved(self.device)/1024/1024)
+                        try:
+                            summary = torch.cuda.memory_summary(self.device)
+                            print("[CUDA-DIAG] Memory Summary (truncated to 5000 chars):\n" + summary[:5000])
+                        except Exception:
+                            pass
+                        print("[CUDA-DIAG] Attempting cache clear...")
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
             raise e
 

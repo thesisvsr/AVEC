@@ -77,14 +77,31 @@ def main(rank, args):
     # Training
     if args.mode == "training":
 
+        # Allow manual override of the starting epoch (e.g., FORCE_INITIAL_EPOCH=45) when
+        # earlier checkpoint was pruned but user wants to "label" subsequent epochs
+        # from an earlier number. This only affects logging / scheduling logic that
+        # depends on the epoch counter – weights still come from the loaded checkpoint.
+        force_initial_epoch = os.environ.get("FORCE_INITIAL_EPOCH")
+        if force_initial_epoch is not None and force_initial_epoch.strip() != "":
+            try:
+                init_epoch = int(force_initial_epoch)
+                if args.rank == 0:
+                    print(f"[INFO] Overriding initial_epoch via FORCE_INITIAL_EPOCH={init_epoch}")
+            except ValueError:
+                if args.rank == 0:
+                    print(f"[WARN] Invalid FORCE_INITIAL_EPOCH value '{force_initial_epoch}', falling back to checkpoint naming")
+                init_epoch = int(args.checkpoint.split("_")[2]) if args.checkpoint is not None else 0
+        else:
+            init_epoch = int(args.checkpoint.split("_")[2]) if args.checkpoint is not None else 0
+
         model.fit(
-            dataset_train=dataset_train, 
-            epochs=getattr(args.config, "epochs", 1000), 
-            dataset_eval=dataset_eval, 
-            eval_steps=getattr(args.config, "eval_steps", args.eval_steps), 
-            verbose_eval=args.verbose_eval, 
-            initial_epoch=int(args.checkpoint.split("_")[2]) if args.checkpoint != None else 0, 
-            callback_path=args.config.callback_path, 
+            dataset_train=dataset_train,
+            epochs=getattr(args.config, "epochs", 1000),
+            dataset_eval=dataset_eval,
+            eval_steps=getattr(args.config, "eval_steps", args.eval_steps),
+            verbose_eval=args.verbose_eval,
+            initial_epoch=init_epoch,
+            callback_path=args.config.callback_path,
             steps_per_epoch=args.steps_per_epoch,
             precision=getattr(args.config, "precision", torch.float32),
             accumulated_steps=getattr(args.config, "accumulated_steps", 1),

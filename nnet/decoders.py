@@ -66,13 +66,39 @@ class ArgMaxDecoder(nn.Module):
         self.axis = axis
 
     def forward(self, outputs, from_logits=True):
+        # Accept (logits, lengths) or [logits, lengths] structures
+        if isinstance(outputs, (list, tuple)):
+            if len(outputs) == 0:
+                return []
+            # Take the first element as logits when decoding predictions
+            primary = outputs[0]
+        else:
+            primary = outputs
 
         if from_logits:
-            # Softmax -> Log -> argmax
-            tokens = outputs.softmax(dim=self.axis).argmax(axis=self.axis).tolist()
+            # Softmax -> argmax along given axis
+            if not torch.is_tensor(primary):
+                # If already a list of indices just return it
+                try:
+                    return list(primary)
+                except Exception:
+                    return []
+            tokens = primary.softmax(dim=self.axis).argmax(axis=self.axis).tolist()
         else:
-            tokens = outputs.tolist()
-
+            # Targets could be (labels, lengths) tuple; accept either raw tensor or container
+            if isinstance(outputs, (list, tuple)) and len(outputs) >= 1 and torch.is_tensor(outputs[0]):
+                tgt = outputs[0]
+            else:
+                tgt = primary
+            if torch.is_tensor(tgt):
+                tokens = tgt.tolist()
+            elif isinstance(tgt, (list, tuple)):
+                tokens = list(tgt)
+            else:
+                try:
+                    tokens = list(tgt)
+                except Exception:
+                    tokens = []
         return tokens
 
 class ClassLabelToWordDecoder(nn.Module):

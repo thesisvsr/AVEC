@@ -184,3 +184,63 @@ class CollateFn(nn.Module):
             collates = collates[0] if len(collates) == 1 else collates
 
         return collates
+
+
+class CollateCTC(nn.Module):
+    """Collate function for samples shaped like LRS/BSRDCTC outputs:
+    (video, audio, label, video_len, audio_len, label_len)
+    Returns a dict with keys: video, audio, label, video_len, audio_len, label_len
+    Label is a 1D concatenated tensor for CTC; label_len provides lengths.
+    Video is stacked (B, C, T, H, W) by padding to max T in batch (repeat last frame).
+    """
+    def __init__(self, pad_video_last=True):
+        super().__init__()
+        self.pad_video_last = pad_video_last
+
+    def forward(self, samples):
+        videos = []
+        video_lens = []
+        labels = []
+        label_lens = []
+        audios = []
+        audio_lens = []
+        max_T = 0
+        for (video, audio, label, vlen, alen, llen) in samples:
+            videos.append(video)
+            video_lens.append(vlen)
+            labels.append(label)
+            label_lens.append(llen)
+            audios.append(audio)
+            audio_lens.append(alen)
+            if video.shape[1] > max_T:
+                max_T = video.shape[1]
+        # Pad videos by repeating last frame
+        padded_videos = []
+        for v in videos:
+            C,T,H,W = v.shape
+            if T < max_T and T>0:
+                pad = v[:, -1:, :, :].expand(C, max_T-T, H, W)
+                v = torch.cat([v, pad], dim=1)
+            padded_videos.append(v)
+        video_batch = torch.stack(padded_videos, dim=0)  # (B,C,T,H,W)
+        # Concatenate labels
+        if labels and labels[0].ndim==1:
+            label_batch = torch.cat(labels, dim=0)
+        else:
+            label_batch = torch.zeros(0, dtype=torch.long)
+        video_len_tensor = torch.stack(video_lens) if len(video_lens)>0 else torch.zeros(0, dtype=torch.long)
+        label_len_tensor = torch.stack(label_lens) if len(label_lens)>0 else torch.zeros(0, dtype=torch.long)
+        batch_dict = {
+            'video': video_batch,
+            'audio': None,  # audio currently unused for BSRD visual-only
+            'label': label_batch,
+            'video_len': video_len_tensor,
+            'audio_len': torch.stack(audio_lens) if len(audio_lens)>0 else torch.zeros(0, dtype=torch.long),
+            'label_len': label_len_tensor
+        }
+        # Add generic keys expected by training loop: inputs (video, video_len) and targets (label, label_len)
+        # Model expects (B, T, H, W, C) so convert from (B, C, T, H, W)
+        video_cl = video_batch.permute(0, 2, 3, 4, 1).contiguous()
+        batch_dict['inputs'] = (video_cl, video_len_tensor)
+        batch_dict['targets'] = (label_batch, label_len_tensor)
+        return batch_dict
