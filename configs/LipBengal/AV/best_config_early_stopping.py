@@ -1,0 +1,309 @@
+"""
+Best Ablation Config for LipBengal with Early Stopping
+Based on T1_frontend (Best Performance: 37.07% accuracy)
+
+Configuration:
+- Script Normalization: phonetic
+- Transfer Mode: frontend (best strategy)
+- Freeze Epochs: 5
+- Encoder LR Mult: 0.2
+- Head LR Mult: 1.0
+- Early Stopping: patience=15, min_delta=0.001
+"""
+
+import sys
+sys.path.append("../../")
+
+import os
+import torch
+import torch.nn as nn
+import nnet
+from nnet import transforms as vtf
+from nnet import optimizers as _optim
+from nnet import schedulers as _schedulers
+
+# ---------------------------------------------------------------------------
+# Early Stopping Configuration
+# ---------------------------------------------------------------------------
+EARLY_STOPPING_PATIENCE = int(os.environ.get("EARLY_STOPPING_PATIENCE", 15))
+EARLY_STOPPING_MIN_DELTA = float(os.environ.get("EARLY_STOPPING_MIN_DELTA", 0.001))
+
+# Environment variable overrides
+LABEL_FORMAT_TYPE = os.environ.get("LABEL_FORMAT_TYPE", "phonetic")
+TRANSFER_MODE = "frontend"  # Best strategy for LipBengal
+FREEZE_ENCODER_EPOCHS = 5
+ENCODER_LR_MULT = 0.2
+HEAD_LR_MULT = 1.0
+TARGET_DATA_FRACTION = 1.0
+
+# ---------------------------------------------------------------------------
+# Data & Transforms
+# ---------------------------------------------------------------------------
+
+crop_size = (88, 88)
+train_video_transform = nn.Sequential(
+    vtf.RandomTemporalShift(max_shift=2),
+    vtf.RandomCropVideo(crop_size),
+    vtf.RandomHorizontalFlipVideo(p=0.5),
+)
+val_video_transform = vtf.CenterCropVideo(crop_size)
+
+collate_fn = nnet.CollateFn(inputs_params=[{"axis": 0}], targets_params=[{"axis": 2}])
+
+training_dataset = nnet.datasets.LipBengal(
+    batch_size=32,
+    collate_fn=collate_fn,
+    mode="train",
+    video_transform=train_video_transform,
+    num_frames=None,
+    fixed_frames=29,
+    indices_path="datasets/LipBengal/indices/train.pt",
+    subset_fraction=TARGET_DATA_FRACTION,
+    subset_seed=42,
+    prepared_only=True,
+    label_format=LABEL_FORMAT_TYPE,
+)
+
+evaluation_dataset = nnet.datasets.LipBengal(
+    batch_size=64,
+    collate_fn=collate_fn,
+    mode="val",
+    video_transform=val_video_transform,
+    fixed_frames=29,
+    indices_path="datasets/LipBengal/indices/val.pt",
+    subset_fraction=1.0,
+    subset_seed=42,
+    prepared_only=True,
+    label_format=LABEL_FORMAT_TYPE,
+)
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+vocab_size = training_dataset.num_classes
+model = nnet.VisualEfficientConformerCE(vocab_size=vocab_size)
+
+# ---------------------------------------------------------------------------
+# Optimizer with differential LR scaling
+# ---------------------------------------------------------------------------
+
+def build_param_groups_with_scaling(model: torch.nn.Module, encoder_lr_scale: float, head_lr_scale: float):
+    decay_modules = (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)
+    no_decay_modules = (torch.nn.LayerNorm, torch.nn.Embedding, torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)
+    decay_params = ("weight",)
+    no_decay_params = ("bias",)
+
+    enc_decay, enc_no_decay, head_decay, head_no_decay = [], [], [], []
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            target_list_decay = enc_decay if full_name.startswith("encoder.") else head_decay
+            target_list_no_decay = enc_no_decay if full_name.startswith("encoder.") else head_no_decay
+            
+            placed = False
+            for nd in no_decay_params:
+                if param_name.endswith(nd):
+                    target_list_no_decay.append(param)
+                    placed = True
+                    break
+            if placed:
+                continue
+            for dp in decay_params:
+                if param_name.endswith(dp) and isinstance(module, decay_modules):
+                    target_list_decay.append(param)
+                    placed = True
+                    break
+                if param_name.endswith(dp) and isinstance(module, no_decay_modules):
+                    target_list_no_decay.append(param)
+                    placed = True
+                    break
+            if not placed:
+                target_list_no_decay.append(param)
+
+    return [
+        {"params": enc_decay, "weight_decay": 0.05, "lr_scale": encoder_lr_scale},
+        {"params": enc_no_decay, "weight_decay": 0.0,  "lr_scale": encoder_lr_scale},
+        {"params": head_decay, "weight_decay": 0.05, "lr_scale": head_lr_scale},
+        {"params": head_no_decay, "weight_decay": 0.0,  "lr_scale": head_lr_scale},
+    ]
+
+
+class MultiScaleAdamW(_optim.AdamW):
+    def step(self, closure=None):
+        base_lr = self.scheduler.step()
+        for group in self.param_groups:
+            scale = group.get("lr_scale", 1.0)
+            group['lr'] = base_lr * scale
+        return super(_optim.AdamW, self).step(closure)
+
+
+_words = training_dataset.classes
+_label_to_word = nnet.ClassLabelToWordDecoder(_words)
+
+transfer_scheduler = _schedulers.CosineAnnealingScheduler(
+    warmup_steps=100,
+    val_max=5e-5,
+    val_min=5e-6,
+    end_step=200000,
+)
+
+param_groups = build_param_groups_with_scaling(model, ENCODER_LR_MULT, HEAD_LR_MULT)
+optimizer = MultiScaleAdamW(
+    params=param_groups,
+    lr=transfer_scheduler,
+    betas=(0.9, 0.98),
+    eps=1e-8,
+)
+
+model.compile(
+    losses=nnet.SoftmaxCrossEntropy(label_smoothing=0.1),
+    metrics={
+        "output": [
+            nnet.CategoricalAccuracy(),
+            nnet.WordErrorRate(),
+            nnet.CharacterErrorRate(),
+        ]
+    },
+    decoders={
+        "output": [
+            None,
+            _label_to_word,
+            _label_to_word,
+        ]
+    },
+    optimizer=optimizer,
+    grad_max_norm=1.0,
+    ema_tau=0.999,
+)
+
+# ---------------------------------------------------------------------------
+# Freezing & Unfreezing Logic
+# ---------------------------------------------------------------------------
+
+def _freeze_backbone_keep_head(m):
+    head_params = set(id(p) for p in m.encoder.head.parameters()) if hasattr(m.encoder, 'head') else set()
+    frozen, kept = 0, 0
+    for p in m.encoder.parameters():
+        if id(p) in head_params:
+            p.requires_grad = True
+            kept += 1
+        else:
+            p.requires_grad = False
+            frozen += 1
+    return frozen, kept
+
+if FREEZE_ENCODER_EPOCHS > 0:
+    frozen, kept = _freeze_backbone_keep_head(model)
+    print(f"[Best Config - Frontend Transfer] Frozen: {frozen}, Trainable: {kept} for {FREEZE_ENCODER_EPOCHS} epochs")
+
+# ---------------------------------------------------------------------------
+# Early Stopping Implementation
+# ---------------------------------------------------------------------------
+
+class EarlyStopping:
+    def __init__(self, patience=15, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_accuracy = None
+        self.early_stop = False
+        
+    def __call__(self, val_accuracy):
+        if self.best_accuracy is None:
+            self.best_accuracy = val_accuracy
+        elif val_accuracy > self.best_accuracy + self.min_delta:
+            self.best_accuracy = val_accuracy
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+        return False
+
+early_stopping = EarlyStopping(patience=EARLY_STOPPING_PATIENCE, min_delta=EARLY_STOPPING_MIN_DELTA)
+
+_orig_on_epoch_end = model.on_epoch_end
+
+def _transfer_on_epoch_end(evaluate, save, log_figure, callback_path, epoch, *a, **kw):
+    res = _orig_on_epoch_end(evaluate, save, log_figure, callback_path, epoch, *a, **kw)
+    
+    # Unfreeze encoder after specified epochs
+    if epoch == FREEZE_ENCODER_EPOCHS:
+        unfroze = 0
+        for p in model.encoder.parameters():
+            if not p.requires_grad:
+                p.requires_grad = True
+                unfroze += 1
+        if unfroze:
+            print(f"[Best Config] Unfroze {unfroze} encoder params at epoch {epoch}")
+    
+    # Early stopping check
+    if res and 'val_metrics' in res:
+        val_acc = res['val_metrics'].get('acc', 0)
+        if early_stopping(val_acc):
+            print(f"\n{'='*80}")
+            print(f"🛑 EARLY STOPPING TRIGGERED at epoch {epoch}")
+            print(f"   Best Accuracy: {early_stopping.best_accuracy:.2f}%")
+            print(f"   No improvement for {EARLY_STOPPING_PATIENCE} epochs")
+            print(f"{'='*80}\n")
+            # Set flag to stop training
+            model._early_stop = True
+    
+    return res
+
+model.on_epoch_end = _transfer_on_epoch_end
+model._early_stop = False
+
+# ---------------------------------------------------------------------------
+# Transfer Learning Weight Loading - FRONTEND ONLY
+# ---------------------------------------------------------------------------
+
+source_ckpt = os.environ.get("SOURCE_CKPT", "callbacks/LRS23/VO/EffConfInterCTC/checkpoints_swa-equal-90-100.ckpt")
+try:
+    ck = torch.load(source_ckpt, map_location="cpu")
+    state = ck.get("model_state_dict", {})
+    msd = model.state_dict()
+    loadable = {}
+    for k, v in state.items():
+        if k.startswith("encoder.front_end") and "head" not in k:
+            if k in msd and getattr(v, 'shape', None) == getattr(msd[k], 'shape', None):
+                loadable[k] = v
+    if loadable:
+        msd.update(loadable)
+        model.load_state_dict(msd, strict=False)
+        print(f"[Transfer Frontend Only] Loaded {len(loadable)} frontend tensors from {source_ckpt}")
+        print(f"[Best Config] This is the BEST performing strategy for LipBengal (37.07% baseline)")
+except Exception as e:
+    print(f"[Transfer] Frontend load failed: {e}")
+
+# ---------------------------------------------------------------------------
+# Training Configuration
+# ---------------------------------------------------------------------------
+
+epochs = 600  # High limit - training stops only when early stopping triggers
+precision = torch.float16
+accumulated_steps = 1
+eval_training = False
+callback_path = "callbacks/LipBengal/AV/best_config_early_stopping"
+verbose_eval = 1
+eval_period_epoch = 1
+saving_period_epoch = 1
+
+try:
+    total_steps = epochs * len(training_dataset)
+    model.optimizer.scheduler.end_step = total_steps
+except Exception:
+    pass
+
+print("\n" + "="*80)
+print("🚀 BEST LIPBENGAL CONFIGURATION WITH EARLY STOPPING")
+print("="*80)
+print(f"Strategy: Frontend Transfer Learning (Best: 37.07% baseline)")
+print(f"Early Stopping: Enabled (patience={EARLY_STOPPING_PATIENCE}, min_delta={EARLY_STOPPING_MIN_DELTA})")
+print(f"Max Epochs: {epochs}")
+print(f"Freeze Duration: {FREEZE_ENCODER_EPOCHS} epochs")
+print(f"Script Normalization: {LABEL_FORMAT_TYPE}")
+print("="*80 + "\n")
+

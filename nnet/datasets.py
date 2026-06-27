@@ -1320,17 +1320,34 @@ class LipBengal(Dataset):
       - label: int class index for the Bengali word
     """
 
-    def __init__(self, batch_size, collate_fn, root="datasets", shuffle=True, mode="train", img_mean=(0.5,), img_std=(0.5,), video_transform=None, speakers_split=None, num_frames=None, indices_path=None, fixed_frames=None, subset_fraction=1.0, subset_seed=0, prepared_only=False):
+    def __init__(self, batch_size, collate_fn, root="datasets", shuffle=True, mode="train", img_mean=(0.5,), img_std=(0.5,), video_transform=None, speakers_split=None, num_frames=None, indices_path=None, fixed_frames=None, subset_fraction=1.0, subset_seed=0, prepared_only=False, label_format="phonetic"):
         super(LipBengal, self).__init__(batch_size=batch_size, collate_fn=collate_fn, root=root, shuffle=shuffle)
 
         assert mode in ["train", "val", "test"], "mode must be one of train/val/test"
+        assert label_format in ["phonetic", "raw", "simple", "mixed"], f"label_format must be one of phonetic/raw/simple/mixed, got {label_format}"
         self.mode = mode
+        self.label_format = label_format
         self.num_frames = num_frames  # optional cap
         self.indices_path = indices_path
         self.fixed_frames = fixed_frames  # if set, enforce fixed temporal length for stacking
         self.prepared_only = prepared_only  # if True, require prepared mouth-crop tensors
         self.subset_fraction = float(subset_fraction) if subset_fraction is not None else 1.0
         self.subset_seed = int(subset_seed) if subset_seed is not None else 0
+        
+        # Load label mappings for script normalization ablation
+        self.label_mapping = None
+        if self.label_format != "phonetic":
+            mapping_file = os.path.join(self.root, "LipBengal", "label_mappings.json")
+            if os.path.isfile(mapping_file):
+                import json
+                with open(mapping_file, 'r', encoding='utf-8') as f:
+                    all_mappings = json.load(f)
+                # Select the appropriate mapping
+                mapping_key = f"phonetic_to_{self.label_format}"
+                self.label_mapping = all_mappings.get(mapping_key, {})
+                print(f"LipBengal: Using label format '{self.label_format}' with {len(self.label_mapping)} mappings")
+            else:
+                raise FileNotFoundError(f"Label mappings file not found: {mapping_file}. Run scripts/create_label_mappings.py first.")
 
         lb_root = os.path.join(self.root, "LipBengal")
         if self.indices_path is not None and os.path.isfile(self.indices_path):
@@ -1399,6 +1416,9 @@ class LipBengal(Dataset):
             for it in self.items:
                 w = it.get("word")
                 if isinstance(w, str) and len(w) > 0:
+                    # Apply label format mapping if needed
+                    if self.label_mapping and w in self.label_mapping:
+                        w = self.label_mapping[w]
                     word_set.add(w)
             if not word_set:
                 # Fallback to filesystem scan if indices lack words
@@ -1408,6 +1428,9 @@ class LipBengal(Dataset):
                     for word in os.listdir(sp_dir):
                         wdir = os.path.join(sp_dir, word)
                         if os.path.isdir(wdir):
+                            # Try to map from filesystem Bengali to target format
+                            if self.label_mapping and word in self.label_mapping:
+                                word = self.label_mapping[word]
                             word_set.add(word)
             self.classes = sorted(list(word_set))
             self.class_dict = {c: i for i, c in enumerate(self.classes)}
@@ -1436,7 +1459,22 @@ class LipBengal(Dataset):
                 for word in os.listdir(sp_dir):
                     wdir = os.path.join(sp_dir, word)
                     if os.path.isdir(wdir):
-                        word_set.add(word)
+                        # Apply label format mapping if needed (filesystem words are in Bengali)
+                        # We need raw_to_phonetic mapping first, then phonetic_to_target
+                        mapped_word = word
+                        if self.label_format != "phonetic" and hasattr(self, 'label_mapping') and self.label_mapping:
+                            # Load raw_to_phonetic mapping to convert filesystem Bengali
+                            mapping_file = os.path.join(self.root, "LipBengal", "label_mappings.json")
+                            if os.path.isfile(mapping_file):
+                                import json
+                                with open(mapping_file, 'r', encoding='utf-8') as f:
+                                    all_maps = json.load(f)
+                                raw_to_phon = all_maps.get('raw_to_phonetic', {})
+                                if word in raw_to_phon:
+                                    phonetic = raw_to_phon[word]
+                                    if phonetic in self.label_mapping:
+                                        mapped_word = self.label_mapping[phonetic]
+                        word_set.add(mapped_word)
             self.classes = sorted(list(word_set))
             self.class_dict = {c: i for i, c in enumerate(self.classes)}
             self.num_classes = len(self.classes)
@@ -1525,6 +1563,9 @@ class LipBengal(Dataset):
         if hasattr(self, "items"):
             entry = self.items[n]
             word = entry["word"]
+            # Apply label format mapping if needed
+            if self.label_mapping and word in self.label_mapping:
+                word = self.label_mapping[word]
             label = torch.tensor(self.class_dict[word], dtype=torch.long)
             # Prefer prepared aligned crops if available
             prepared_path = entry.get("prepared")
