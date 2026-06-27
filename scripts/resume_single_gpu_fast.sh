@@ -96,3 +96,4 @@ ls -lht "$CALLBACK_DIR"/checkpoints_epoch_*.ckpt 2>/dev/null | head -3 | tee -a 
 
 
 
+
